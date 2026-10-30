@@ -493,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "eyre",
  "ipnet",
+ "log",
  "mio",
  "nix",
  "socket2",

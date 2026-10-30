@@ -1,15 +1,20 @@
 use std::{
-	io::Write,
-	net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
-	os::fd::AsRawFd,
+	io::{ErrorKind, IoSliceMut, Write},
+	net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+	os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 	process::{Command, Stdio},
 	str::FromStr,
 };
 
 use eyre::{OptionExt, Result, eyre};
 use ipnet::{Ipv4Net, Ipv6Net};
+use log::{error, warn};
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
-use socket2::{Domain, Protocol, Socket, Type};
+use nix::{
+	errno::Errno,
+	sys::socket::{MsgFlags, SockaddrStorage, recv, recvfrom},
+};
+use socket2::{Domain, Protocol, SockAddrStorage, Socket, Type};
 
 const TUN: Token = Token(usize::MAX);
 const STATELESS: Token = Token(usize::MAX - 1);
@@ -55,7 +60,8 @@ fn main() -> Result<()> {
 	// For tcp streams we map their fd into 0.0.0.0/8
 	let fd_net = Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 8).unwrap();
 	// We need to mask out all our currently open file descriptors so that they aren't publicly reachable/writable...
-	let min_fd = sock_stream.as_raw_fd() as u32;
+	// This isn't doing that, it is just guessing that we've used all the fds from 0-sock_stream.
+	let fd_net_hosts = (sock_stream.as_raw_fd() as u32 + 1)..=fd_net.hostmask().to_bits();
 
 	sock_nat6.set_only_v6(true)?;
 	sock_stream.set_only_v6(false)?;
@@ -66,7 +72,7 @@ fn main() -> Result<()> {
 	sock_stream.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 
 	// Setup async
-	let events = Events::with_capacity(256);
+	let mut events = Events::with_capacity(256);
 	let mut poll = Poll::new()?;
 
 	tun.set_nonblock()?;
@@ -98,5 +104,105 @@ fn main() -> Result<()> {
 		Interest::READABLE,
 	)?;
 
-	Ok(())
+	let mut buffer = vec![0; 65536].into_boxed_slice();
+
+	loop {
+		let mut do_accept = false;
+		'event: for e in events.into_iter() {
+			match e.token() {
+				// We delay accepting new clients until we've handled all existing ones.
+				// This ensures we don't introduce new fds until the old ones are potentially
+				// cleaned up.  That means receiving mutliple events for the same fd where
+				// we've already closed it should be fine: we just recv on an empty fd instead
+				// of possibly recv on a newly accepted fd.
+				STREAM => do_accept = true,
+				STATELESS | NAT4 | NAT6 => loop {
+					let sock = match e.token() {
+						STATELESS => &sock_stateless,
+						NAT4 => &sock_nat4,
+						NAT6 => &sock_nat6,
+						_ => unreachable!(),
+					};
+					let (datalen, peer): (usize, SockaddrStorage) =
+						match recvfrom(sock.as_raw_fd(), &mut buffer) {
+							Err(Errno::EWOULDBLOCK) => break,
+							Err(e) => {
+								warn!("{e} on recvfrom for {:?}", sock.local_addr());
+								break;
+							}
+							Ok((..20, _)) => continue,
+							Ok((_, None)) => {
+								warn!("recvfrom returned no client address?");
+								continue;
+							}
+							Ok((n, Some(peer))) => (n, peer),
+						};
+					// TODO: Parse the message, emit the response
+				},
+				Token(i) => {
+					let raw = i as RawFd;
+					let mut do_dispose = e.is_error() || e.is_read_closed() || e.is_write_closed();
+					loop {
+						// SAFETY: Always perform at least one syscall to check for closed sockets (EBADF) before double closing in do_dispose
+						let available = match recv(
+							raw,
+							&mut buffer,
+							MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK,
+						) {
+							// SAFETY: Detect already closed sockets
+							Err(Errno::EBADF) => continue 'event,
+							Err(Errno::EWOULDBLOCK) => break,
+							Err(_) => {
+								do_dispose = true;
+								break;
+							}
+							// If there's less than 20 bytes read don't even try to read it as STUN
+							// Otherwise, bad data in the buffer from a previous read could unrelated tcp streams.
+							// This isn't a problem for UDP since those are always complete/error
+							Ok(..20) => break,
+							Ok(n) => n,
+						};
+						// TODO: Parse the message, emit the response
+						// TODO: Use a blocking read to consume
+					}
+					if do_dispose {
+						// SAFETY: We've checked that the socket is alive (not EBADF) so we just close/Drop.  If this is a problem, then just call close manually and check for errors.
+						unsafe { OwnedFd::from_raw_fd(raw) };
+					}
+				}
+			}
+		}
+		if do_accept {
+			loop {
+				let (stream, address) = match sock_stream.accept() {
+					Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+					Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+					Err(e) if e.kind() == ErrorKind::ConnectionAborted => continue,
+					Err(e) => {
+						warn!("{e} during tcp accept");
+						break;
+					}
+					Ok(v) => v,
+				};
+				let raw = stream.as_raw_fd();
+				if !fd_net_hosts.contains(&(raw as u32)) {
+					error!(
+						"{raw} is not within our fd network! Dropping connection from {address:?}"
+					);
+					continue;
+				}
+				if let Err(e) = poll.registry().register(
+					&mut SourceFd(&raw),
+					Token(raw as usize),
+					Interest::READABLE,
+				) {
+					error!("{e} during stream poll registration.");
+					continue;
+				};
+				// Leak the fd now that we've registered it
+				let _ = stream.into_raw_fd();
+			}
+		}
+		poll.poll(&mut events, None)?;
+	}
 }
