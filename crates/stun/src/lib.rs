@@ -1,10 +1,11 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
-use core::cell::Cell;
+use bytes::BufMut;
+use core::{cell::Cell, fmt::Write, net::SocketAddr};
 use zerocopy::{
-	Immutable, IntoBytes, KnownLayout, SplitAt, TryFromBytes, Unaligned, network_endian::U16,
-	try_transmute,
+	FromBytes, Immutable, IntoBytes, KnownLayout, SplitAt, TryFromBytes, Unaligned,
+	network_endian::U16, try_transmute,
 };
 
 #[repr(u8)]
@@ -84,4 +85,75 @@ pub struct Stun {
 	length: Cell<U16>,
 	pub id: Txid,
 	body: [[u8; 4]],
+}
+
+#[repr(C, align(4))]
+#[derive(Debug, PartialEq, Eq, KnownLayout, Immutable, FromBytes, SplitAt)]
+pub struct Attr {
+	pub typ: u16,
+	length: U16,
+	pub value: [u8], // Value may be longer than length while writing
+}
+
+pub struct AttrReader<'i> {
+	target: &'i Stun,
+}
+pub struct AttrWriter<'i> {
+	prefix: &'i Stun,
+	target: &'i mut Attr,
+}
+
+impl<'i> IntoIterator for &'i Stun {
+	type Item = (&'i Stun, &'i Attr);
+	type IntoIter = AttrReader<'i>;
+	fn into_iter(self) -> Self::IntoIter {
+		// TODO: Trim the stun message
+		// TODO: Zero the length since it becomes the offset we use to iterate the attributes
+		todo!();
+	}
+}
+impl<'i> Iterator for AttrReader<'i> {
+	type Item = (&'i Stun, &'i Attr);
+	fn next(&mut self) -> Option<Self::Item> {
+		let offset = self.target.length.get().get();
+		// TODO: Split the target Stun reference at the offset
+		// TODO: Read an Attr from the prefix, then trim it to it's length
+		// TODO: Increment the offset/length past the attribute
+		todo!()
+	}
+}
+
+impl Drop for AttrWriter<'_> {
+	fn drop(&mut self) {
+		// TODO: Once the attribute has its final length, zero the Attribute's padding and increment the Stun's offset/length
+		todo!()
+	}
+}
+unsafe impl BufMut for AttrWriter<'_> {
+	fn remaining_mut(&self) -> usize {
+		todo!()
+	}
+	unsafe fn advance_mut(&mut self, cnt: usize) {
+		todo!()
+	}
+	fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+		todo!()
+	}
+}
+impl Write for AttrWriter<'_> {
+	fn write_str(&mut self, s: &str) -> core::fmt::Result {
+		todo!()
+	}
+}
+impl AttrWriter<'_> {
+	// BufMut extensions for STUN specific stuff
+	pub fn put_fingerprint(&mut self) {
+		todo!()
+	}
+	pub fn put_integrity_sha1(&mut self) {
+		todo!()
+	}
+	pub fn put_address(&mut self, addr: SocketAddr) {
+		todo!()
+	}
 }

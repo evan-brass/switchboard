@@ -423,6 +423,7 @@ dependencies = [
 name = "stun"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "rand",
  "zerocopy",
 ]
