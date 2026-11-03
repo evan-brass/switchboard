@@ -1,0 +1,9 @@
+table inet turnserver {
+    flags owner;
+    chain alloc {
+        type nat hook input priority srcnat; policy accept;
+
+        meta l4proto != udp return
+        udp dport != 3478 return
+    }
+}

@@ -1,28 +1,29 @@
 use std::{
 	io::{ErrorKind, IoSliceMut, Write},
-	net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+	net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
 	os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 	process::{Command, Stdio},
+	ptr::null_mut,
 	str::FromStr,
 };
 
 use eyre::{OptionExt, Result, eyre};
 use ipnet::{Ipv4Net, Ipv6Net};
-use log::{error, warn};
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::{
 	errno::Errno,
-	sys::socket::{MsgFlags, SockaddrStorage, recv, recvfrom},
+	sys::socket::{MsgFlags, RecvMsg, SockaddrStorage, recvmsg},
 };
-use socket2::{Domain, Protocol, SockAddrStorage, Socket, Type};
-
-const TUN: Token = Token(usize::MAX);
-const STATELESS: Token = Token(usize::MAX - 1);
-const NAT4: Token = Token(usize::MAX - 2);
-const NAT6: Token = Token(usize::MAX - 3);
-const STREAM: Token = Token(usize::MAX - 4);
+use socket2::{Domain, Protocol, Socket, Type};
+use stun::{Stun, zerocopy::TryFromBytes};
+use tracing::{error, info, warn};
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
+	let ts = tracing_subscriber::fmt::Subscriber::builder()
+		.with_env_filter(EnvFilter::from_default_env());
+	SubscriberInitExt::try_init(ts)?;
+
 	// Figure out what subnet we're supposed to assign to our vpn interface
 	let net = match std::env::var("NET") {
 		Err(std::env::VarError::NotPresent) => "2001:db8::3478:0:0/96".into(),
@@ -37,19 +38,27 @@ fn main() -> Result<()> {
 		.nth(1)
 		.ok_or_eyre("The behavior of ipnet's Ipv6AddrRange must have changed.")?;
 
-	// Create our vpn interface
-	let tun = tun::create(&tun::configure().address(router).netmask(net.netmask()))?;
-
 	// Apply our firewall rules using a child nft process
 	let nft = Command::new("nft")
 		.args(["-f", "-"])
 		.stdin(Stdio::piped())
 		.spawn()?;
 	let mut rules = nft.stdin.ok_or_eyre("Where's the nft stdin?")?;
+	// TODO: Might want to move this later in the program so that we don't trample anything else running on :3478 before we bind the socket...
 	rules.write_all(include_bytes!("../rules.nft"))?;
 
 	// Enable ipv6 forwarding
 	std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
+
+	// Setup async
+	let mut events = Events::with_capacity(256);
+	let mut poll = Poll::new()?;
+
+	// Create our vpn interface
+	let tun = tun_rs::DeviceBuilder::new()
+		.ipv6(router, net.netmask())
+		.enable(false)
+		.build_sync()?;
 
 	// 0.0.0.0:8743/udp, 0.0.0.0:3478/udp, [::]:3478/udp?v6-only, [::]:3478/tcp
 	let sock_stateless = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -61,7 +70,12 @@ fn main() -> Result<()> {
 	let fd_net = Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 8).unwrap();
 	// We need to mask out all our currently open file descriptors so that they aren't publicly reachable/writable...
 	// This isn't doing that, it is just guessing that we've used all the fds from 0-sock_stream.
-	let fd_net_hosts = (sock_stream.as_raw_fd() as u32 + 1)..=fd_net.hostmask().to_bits();
+	let fd_net_bottom = [&sock_stateless, &sock_nat4, &sock_nat6, &sock_stream]
+		.map(|s| s.as_raw_fd() as u32 + 1)
+		.into_iter()
+		.max()
+		.unwrap();
+	let fd_net_hosts = fd_net_bottom..=fd_net.hostmask().to_bits();
 
 	sock_nat6.set_only_v6(true)?;
 	sock_stream.set_only_v6(false)?;
@@ -71,105 +85,128 @@ fn main() -> Result<()> {
 	sock_nat6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 	sock_stream.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 
-	// Setup async
-	let mut events = Events::with_capacity(256);
-	let mut poll = Poll::new()?;
-
-	tun.set_nonblock()?;
+	tun.set_nonblocking(true)?;
 	sock_stateless.set_nonblocking(true)?;
 	sock_nat4.set_nonblocking(true)?;
 	sock_nat6.set_nonblocking(true)?;
 	sock_stream.set_nonblocking(true)?;
 
-	poll.registry()
-		.register(&mut SourceFd(&tun.as_raw_fd()), TUN, Interest::READABLE)?;
-	poll.registry().register(
-		&mut SourceFd(&sock_stateless.as_raw_fd()),
-		STATELESS,
-		Interest::READABLE,
-	)?;
-	poll.registry().register(
-		&mut SourceFd(&sock_nat4.as_raw_fd()),
-		NAT4,
-		Interest::READABLE,
-	)?;
-	poll.registry().register(
-		&mut SourceFd(&sock_nat6.as_raw_fd()),
-		NAT6,
-		Interest::READABLE,
-	)?;
-	poll.registry().register(
-		&mut SourceFd(&sock_stream.as_raw_fd()),
-		STREAM,
-		Interest::READABLE,
-	)?;
+	sock_stream.listen(10)?;
+
+	fn register(poll: &Poll, fd: RawFd) -> Result<()> {
+		let token = Token(fd as usize);
+		poll.registry()
+			.register(&mut SourceFd(&fd), token, Interest::READABLE)?;
+		Ok(())
+	}
+	register(&poll, tun.as_raw_fd())?;
+	let tun_token = Token(tun.as_raw_fd() as usize);
+	register(&poll, sock_stateless.as_raw_fd())?;
+	register(&poll, sock_nat4.as_raw_fd())?;
+	register(&poll, sock_nat6.as_raw_fd())?;
+	register(&poll, sock_stream.as_raw_fd())?;
+	let accept_token = Token(sock_stream.as_raw_fd() as usize);
 
 	let mut buffer = vec![0; 65536].into_boxed_slice();
 
 	loop {
 		let mut do_accept = false;
 		'event: for e in events.into_iter() {
-			match e.token() {
-				// We delay accepting new clients until we've handled all existing ones.
-				// This ensures we don't introduce new fds until the old ones are potentially
-				// cleaned up.  That means receiving mutliple events for the same fd where
-				// we've already closed it should be fine: we just recv on an empty fd instead
-				// of possibly recv on a newly accepted fd.
-				STREAM => do_accept = true,
-				STATELESS | NAT4 | NAT6 => loop {
-					let sock = match e.token() {
-						STATELESS => &sock_stateless,
-						NAT4 => &sock_nat4,
-						NAT6 => &sock_nat6,
-						_ => unreachable!(),
-					};
-					let (datalen, peer): (usize, SockaddrStorage) =
-						match recvfrom(sock.as_raw_fd(), &mut buffer) {
-							Err(Errno::EWOULDBLOCK) => break,
-							Err(e) => {
-								warn!("{e} on recvfrom for {:?}", sock.local_addr());
-								break;
-							}
-							Ok((..20, _)) => continue,
-							Ok((_, None)) => {
-								warn!("recvfrom returned no client address?");
-								continue;
-							}
-							Ok((n, Some(peer))) => (n, peer),
-						};
-					// TODO: Parse the message, emit the response
-				},
-				Token(i) => {
-					let raw = i as RawFd;
-					let mut do_dispose = e.is_error() || e.is_read_closed() || e.is_write_closed();
-					loop {
-						// SAFETY: Always perform at least one syscall to check for closed sockets (EBADF) before double closing in do_dispose
-						let available = match recv(
-							raw,
-							&mut buffer,
-							MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK,
-						) {
-							// SAFETY: Detect already closed sockets
-							Err(Errno::EBADF) => continue 'event,
-							Err(Errno::EWOULDBLOCK) => break,
-							Err(_) => {
-								do_dispose = true;
-								break;
-							}
-							// If there's less than 20 bytes read don't even try to read it as STUN
-							// Otherwise, bad data in the buffer from a previous read could unrelated tcp streams.
-							// This isn't a problem for UDP since those are always complete/error
-							Ok(..20) => break,
-							Ok(n) => n,
-						};
-						// TODO: Parse the message, emit the response
-						// TODO: Use a blocking read to consume
+			if e.token() == tun_token {
+				todo!("{e:?}")
+			}
+			if e.token() == accept_token {
+				do_accept = true;
+				continue;
+			}
+			let fd = e.token().0 as RawFd;
+			let is_tcp = fd_net_hosts.contains(&(fd as u32));
+
+			let mut do_dispose = e.is_error() || e.is_read_closed() || e.is_write_closed();
+			loop {
+				// SAFETY: Always perform at least one syscall to check for closed sockets (EBADF) before double closing in do_dispose
+				let mut iov = [IoSliceMut::new(&mut buffer)];
+				let RecvMsg {
+					bytes: available,
+					address,
+					flags: _, // TODO: Do I need this?
+					..
+				} = match recvmsg::<SockaddrStorage>(
+					fd,
+					&mut iov,
+					None,
+					if is_tcp {
+						MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK
+					} else {
+						MsgFlags::MSG_DONTWAIT
+					},
+				) {
+					// SAFETY: Detect already closed sockets
+					Err(Errno::EBADF) => continue 'event,
+					Err(Errno::EWOULDBLOCK) => break,
+					Err(_) => {
+						if is_tcp {
+							do_dispose = true;
+						}
+						break;
 					}
-					if do_dispose {
-						// SAFETY: We've checked that the socket is alive (not EBADF) so we just close/Drop.  If this is a problem, then just call close manually and check for errors.
-						unsafe { OwnedFd::from_raw_fd(raw) };
+					// If there's less than 20 bytes read don't even try to read it as STUN
+					// Otherwise, bad data in the buffer from a previous read could close unrelated tcp streams.
+					// This isn't a problem for UDP since those are always complete/error
+					Ok(RecvMsg { bytes: ..20, .. }) => {
+						// Partially received TCP -> wait, UDP -> skip/drop
+						if is_tcp {
+							continue;
+						} else {
+							break;
+						}
+					}
+					Ok(v) => v,
+				};
+
+				let buffer_length = buffer.len();
+				let msg = match Stun::try_mut_from_bytes(&mut buffer) {
+					Err(stun::zerocopy::ConvertError::Validity(v)) => {
+						info!("Stun message invalid {v} closing");
+						do_dispose = true;
+						break;
+					}
+					Err(e) => panic!("{e:?}"),
+					Ok(v) => v,
+				};
+
+				let frame_length = msg.frame_length();
+				// Frames which exceed our buffer
+				if frame_length > buffer_length {
+					do_dispose = true;
+					break;
+				}
+				// Frames which are not fully received
+				if frame_length > available {
+					// Partially received TCP -> wait, UDP -> skip/drop
+					if is_tcp { break } else { continue }
+				}
+				// Consume the frame
+				if is_tcp {
+					let mut remaining = frame_length;
+					while remaining > 0 {
+						let ret = unsafe {
+							nix::libc::recv(fd, null_mut(), remaining, MsgFlags::MSG_TRUNC.bits())
+						};
+						remaining =
+							remaining.saturating_sub(Errno::result(ret).map(|r| r as usize)?);
 					}
 				}
+
+				info!("STUN: {fd} {:?} {:?} {address:?}", msg.typ, msg.id);
+				for (_, attr) in msg.into_iter() {
+					info!(" - {:04X} {:?}", u16::from_be(attr.typ), &attr.value);
+				}
+			}
+			if is_tcp && do_dispose {
+				// SAFETY: We've checked that the socket is alive (not EBADF) so we just close/Drop.  If this is a problem, then just call close manually and check for errors.
+				info!("Closing stream");
+				unsafe { OwnedFd::from_raw_fd(fd) };
 			}
 		}
 		if do_accept {
@@ -184,18 +221,14 @@ fn main() -> Result<()> {
 					}
 					Ok(v) => v,
 				};
-				let raw = stream.as_raw_fd();
-				if !fd_net_hosts.contains(&(raw as u32)) {
+				let fd = stream.as_raw_fd();
+				if !fd_net_hosts.contains(&(fd as u32)) {
 					error!(
-						"{raw} is not within our fd network! Dropping connection from {address:?}"
+						"{fd} is not within our fd network! Dropping connection from {address:?}"
 					);
 					continue;
 				}
-				if let Err(e) = poll.registry().register(
-					&mut SourceFd(&raw),
-					Token(raw as usize),
-					Interest::READABLE,
-				) {
+				if let Err(e) = register(&poll, fd) {
 					error!("{e} during stream poll registration.");
 					continue;
 				};

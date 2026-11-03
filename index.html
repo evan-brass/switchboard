@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<script type="module">
+const config = {
+  iceServers: [{
+    urls: [
+      'turn:192.168.20.200',
+      'turn:192.168.20.200:8743',
+      'turn:192.168.20.200?transport=tcp',
+      'turn:[2001:470:eb23::200]',
+      'turn:[2001:470:eb23::200]?transport=tcp',
+    ],
+    username: 'user',
+    credential: 'password',
+  }]
+};
+const t = new RTCPeerConnection(config);
+t.addEventListener('icecandidate', ({candidate}) => console.log(candidate));
+t.addEventListener('icecandidateerror', console.error);
+t.createDataChannel('');
+await t.setLocalDescription();
+</script>

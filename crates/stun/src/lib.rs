@@ -1,8 +1,10 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
+#![allow(unused)]
 
 use bytes::BufMut;
 use core::{cell::Cell, fmt::Write, net::SocketAddr};
+pub use zerocopy;
 use zerocopy::{
 	FromBytes, Immutable, IntoBytes, KnownLayout, SplitAt, TryFromBytes, Unaligned,
 	network_endian::U16, try_transmute,
@@ -86,6 +88,9 @@ pub struct Stun {
 	pub id: Txid,
 	body: [[u8; 4]],
 }
+impl Stun {
+	pub const MAX_LENGTH: u16 = 0xffe0; // (((0xffff & ~0b11) - 20) - 8)
+}
 
 #[repr(C, align(4))]
 #[derive(Debug, PartialEq, Eq, KnownLayout, Immutable, FromBytes, SplitAt)]
@@ -93,6 +98,15 @@ pub struct Attr {
 	pub typ: u16,
 	length: U16,
 	pub value: [u8], // Value may be longer than length while writing
+}
+impl Attr {
+	pub const MAX_LENGTH: u16 = Stun::MAX_LENGTH - 4;
+	#[inline]
+	pub fn padded_length(&self) -> u16 {
+		let length = self.length.get();
+		assert!(length <= Self::MAX_LENGTH, "Attribute length too large");
+		(length + 3) & !3
+	}
 }
 
 pub struct AttrReader<'i> {
@@ -103,23 +117,67 @@ pub struct AttrWriter<'i> {
 	target: &'i mut Attr,
 }
 
+impl Stun {
+	pub fn frame_length(&self) -> usize {
+		let length = self.length.get().get();
+		if !length.is_multiple_of(4) {
+			return usize::MAX;
+		}
+		20 + length as usize
+	}
+	/// Convert the in-place length into a safe offset to split at
+	fn offset(&self) -> usize {
+		let length = self.length.get().get();
+		if length.is_multiple_of(4) {
+			usize::min(length as usize >> 2, self.body.len())
+		} else {
+			0
+		}
+	}
+	pub fn split(&self) -> (&Self, &[[u8; 4]]) {
+		self.split_at(self.offset()).unwrap().via_into_bytes()
+	}
+	pub fn split_mut(&mut self) -> (&mut Self, &mut [[u8; 4]]) {
+		self.split_at_mut(self.offset()).unwrap().via_into_bytes()
+	}
+}
 impl<'i> IntoIterator for &'i Stun {
 	type Item = (&'i Stun, &'i Attr);
 	type IntoIter = AttrReader<'i>;
 	fn into_iter(self) -> Self::IntoIter {
-		// TODO: Trim the stun message
-		// TODO: Zero the length since it becomes the offset we use to iterate the attributes
-		todo!();
+		let (target, _) = self.split();
+		target.length.set(U16::new(0));
+		Self::IntoIter { target }
 	}
 }
 impl<'i> Iterator for AttrReader<'i> {
 	type Item = (&'i Stun, &'i Attr);
 	fn next(&mut self) -> Option<Self::Item> {
-		let offset = self.target.length.get().get();
-		// TODO: Split the target Stun reference at the offset
-		// TODO: Read an Attr from the prefix, then trim it to it's length
-		// TODO: Increment the offset/length past the attribute
-		todo!()
+		let (prefix, rest) = self.target.split();
+		let Some(max_attr_len) = Attr::MAX_LENGTH.checked_sub(prefix.length.get().get()) else {
+			return None;
+		};
+		let (attr, _) = match Attr::ref_from_prefix_with_elems(rest.as_flattened(), 0) {
+			Err(zerocopy::ConvertError::Alignment(_)) => {
+				unreachable!("Every offset within Stun.body is also align(4)")
+			}
+			Err(zerocopy::ConvertError::Validity(_)) => {
+				unreachable!("Attr is FromBytes and has no bit validity requirements")
+			}
+			Err(zerocopy::ConvertError::Size(_)) => return None,
+			Ok(v) => v,
+		};
+		let attr_length = attr.length.get();
+		if attr_length > max_attr_len {
+			return None;
+		}
+		let (attr, _) =
+			Attr::ref_from_prefix_with_elems(rest.as_flattened(), attr_length as usize).ok()?;
+
+		// Increment the Stun length past this attribute
+		prefix.length.update(|l| l + 4 + attr.padded_length());
+
+		Some((prefix, attr))
 	}
 }
 
