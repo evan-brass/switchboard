@@ -155,7 +155,7 @@ fn main() -> Result<()> {
 					// This isn't a problem for UDP since those are always complete/error
 					Ok(RecvMsg { bytes: ..20, .. }) => {
 						// Partially received TCP -> wait, UDP -> skip/drop
-						if is_tcp {
+						if is_tcp && !do_dispose {
 							continue;
 						} else {
 							break;
@@ -236,6 +236,11 @@ fn main() -> Result<()> {
 				let _ = stream.into_raw_fd();
 			}
 		}
-		poll.poll(&mut events, None)?;
+		match poll.poll(&mut events, None) {
+			Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+				continue;
+			}
+			v => v?,
+		}
 	}
 }
