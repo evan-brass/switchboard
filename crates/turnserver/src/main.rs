@@ -42,10 +42,12 @@ fn main() -> Result<()> {
 	let nft = Command::new("nft")
 		.args(["-f", "-"])
 		.stdin(Stdio::piped())
+		.stderr(Stdio::inherit())
 		.spawn()?;
 	let mut rules = nft.stdin.ok_or_eyre("Where's the nft stdin?")?;
 	// TODO: Might want to move this later in the program so that we don't trample anything else running on :3478 before we bind the socket...
 	rules.write_all(include_bytes!("../rules.nft"))?;
+	rules.flush()?;
 
 	// Enable ipv6 forwarding
 	std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
