@@ -1,34 +1,20 @@
-table inet turnserver {
-	# flags owner;
-	chain prerouting {
-		type filter hook prerouting priority raw; policy accept;
-
-		meta l4proto != udp \
-		udp dport != 3478 \
-		@th,96,32 0x2112a442 # STUN Magic Cookie \
-		@th,64,16 vmap { 0x0003: return, 0x0016: return } # STUN Allocate, Send
-
-		notrack
-	}
-	chain output {
-		type filter hook output priority raw; policy accept;
-
-		meta l4proto != udp \
-		udp sport != 3478 \
-		@th,96,32 0x2112a442 # STUN Magic Cookie \
-		@th,64,16 vmap { 0x0103: return, 0x0017: return } # STUN Allocated, Recv
-
-		notrack
-	}
-	chain input {
-		type nat hook input priority srcnat; policy accept;
-
-		meta l4proto != udp return
-		udp dport != 3478 return
-		@th,96,32 0x2112a442 return # STUN Magic Cookie
-		@th,64,16 vmap { 0x0000-0x0003: return, 0x0004-0x0015: return, 0x0017-0xffff: return } # STUN !(Allocate || Send)
-
-		ip protocol udp snat to 198.18.0.0-198.18.255.255:10000-65535
-		ip6 nexthdr udp snat to [::6666:198.19.0.0]-[::6666:198.19.255.255]:10000-65535
-	}
-}
+add table inet turnserver { flags owner; }
+add chain inet turnserver prerouting { type filter hook prerouting priority raw; policy accept; }
+add rule inet turnserver prerouting meta l4proto != udp \
+udp dport != 3478 \
+@th,96,32 0x2112A442 # STUN Magic Cookie \
+@th,64,16 vmap { 0x0003: return, 0x0016: return } # STUN Allocate, Send
+add rule inet turnserver prerouting notrack
+add chain inet turnserver output { type filter hook output priority raw; policy accept; }
+add rule inet turnserver output meta l4proto != udp \
+udp sport != 3478 \
+@th,96,32 0x2112A442 # STUN Magic Cookie \
+@th64,16 vmap { 0x0103: return, 0x0017: return } # STUN Allocated, Recv
+add rule inet turnserver output notrack
+add chain inet turnserver input { type nat hook input priority srcnat; policy accept; }
+add rule inet turnserver input meta l4proto != udp return
+add rule inet turnserver input udp dport != 3478 return
+add rule inet turnserver input @th,96,32 != 0x2112A442 return # STUN Magic Cookie
+add rule inet turnserver input @th,64,16 vmap { 0x0000-0x0002: return, 0x0004-0x0015: return, 0x0017-0xffff: return } # STUN !(Allocate || Send)
+add rule inet turnserver input ip protocol udp snat to 198.18.0.0/16:10000-65535
+add rule inet turnserver input ip6 nexthdr udp snat to ::6666:198.19.0.0/112:10000-65535
