@@ -10,6 +10,9 @@ use zerocopy::{
 	network_endian::U16, try_transmute,
 };
 
+pub mod errcode;
+pub mod known;
+
 #[repr(u8)]
 #[derive(
 	Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, Unaligned, TryFromBytes, IntoBytes,
@@ -90,6 +93,10 @@ pub struct Stun {
 }
 impl Stun {
 	pub const MAX_LENGTH: u16 = 0xffe0; // (((0xffff & ~0b11) - 20) - 8)
+	#[inline]
+	pub fn clear(&self) {
+		self.length.set(U16::new(0));
+	}
 }
 
 #[repr(C, align(4))]
@@ -106,6 +113,10 @@ impl Attr {
 		let length = self.length.get();
 		assert!(length <= Self::MAX_LENGTH, "Attribute length too large");
 		(length + 3) & !3
+	}
+	#[inline]
+	pub fn is_comprehension_required(&self) -> bool {
+		self.typ & 0x8000 == 0
 	}
 }
 
@@ -146,7 +157,7 @@ impl<'i> IntoIterator for &'i Stun {
 	type IntoIter = AttrReader<'i>;
 	fn into_iter(self) -> Self::IntoIter {
 		let (target, _) = self.split();
-		target.length.set(U16::new(0));
+		target.clear(); // Zero the length since it is also our iterator offset.
 		Self::IntoIter { target }
 	}
 }
@@ -214,4 +225,18 @@ impl AttrWriter<'_> {
 	pub fn put_address(&mut self, addr: SocketAddr) {
 		todo!()
 	}
+}
+
+#[repr(u8)]
+#[derive(
+	Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, Unaligned, TryFromBytes, IntoBytes,
+)]
+pub enum Transport {
+	Udp = 17,
+}
+#[repr(C, align(4))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, TryFromBytes, IntoBytes)]
+pub struct RequestedTransport {
+	pub proto: Transport,
+	pad1: [u8; 3],
 }

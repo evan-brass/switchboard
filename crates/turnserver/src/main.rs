@@ -15,7 +15,7 @@ use nix::{
 	sys::socket::{MsgFlags, RecvMsg, SockaddrStorage, getpeername, recvmsg},
 };
 use socket2::{Domain, Protocol, Socket, Type};
-use stun::{Stun, zerocopy::TryFromBytes};
+use stun::{Class, RequestedTransport, Stun, errcode::ClientErr, known, zerocopy::TryFromBytes};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
@@ -226,10 +226,45 @@ fn main() -> Result<()> {
 				}
 
 				info!("STUN: {fd} {:?} {:?} {address:?}", msg.typ, msg.id);
+				let Class::Req(method) = msg.typ else {
+					info!("Dropping non-request message");
+					continue;
+				};
+
+				let mut error = None;
+				let mut unknown_attributes = Vec::new();
+
 				for (_, attr) in msg.into_iter() {
-					info!(" - {:04X} {:?}", u16::from_be(attr.typ), &attr.value);
+					match attr.typ {
+						known::REQUESTED_TRANSPORT => {
+							let Ok(_) = RequestedTransport::try_read_from_bytes(&attr.value) else {
+								error = Some((ClientErr::UnsupportedTransportProtocol, ""));
+								break;
+							};
+						}
+						_ if attr.is_comprehension_required() => {
+							unknown_attributes.push(attr.typ);
+							warn!(" - {:04X} {:?}", u16::from_be(attr.typ), &attr.value);
+						}
+						_ => {
+							info!(" - {:04X} {:?}", u16::from_be(attr.typ), &attr.value);
+						}
+					}
+				}
+				// TODO: return 401/403/441 if attributes are missing
+
+				// Respond / Handle the message
+				if let Some((code, reason)) = error {
+					info!("Message handling returned error {code:?} {reason}");
+					if method.is_indication() {
+						continue;
+					}
+					msg.clear();
+					msg.typ = method.failure().into();
+					// TODO: Write the
 				}
 			}
+
 			if is_tcp && do_dispose {
 				// SAFETY: We've checked that the socket is alive (not EBADF) so we just close/Drop.  If this is a problem, then just call close manually and check for errors.
 				info!("Closing stream");

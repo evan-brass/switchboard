@@ -1,0 +1,108 @@
+//! Definitions taken from https://www.iana.org/assignments/stun-parameters
+
+macro_rules! define {
+	() => {};
+
+	// Reserved
+	($low:literal $( - $high:literal)? Reserved $($rest:tt)*) => {
+		define!($($rest)*);
+	};
+
+	// Definitions
+	($code:literal $name:ident $rfc:literal $($rest:tt)*) => {
+		#[doc = concat!("Defined by ", $rfc)]
+		pub const $name: u16 = u16::to_be($code);
+		define!($($rest)*);
+	};
+}
+
+define! {
+	0x0000 Reserved
+	0x0001 MAPPED_ADDRESS "rfc8489"
+	0x0002 Reserved // RESPONSE_ADDRESS
+	0x0003 Reserved // CHANGE_REQUEST
+	0x0004 Reserved // SOURCE_ADDRESS
+	0x0005 Reserved // CHANGED_ADDRESS
+	0x0006 USERNAME "rfc8489"
+	0x0007 Reserved // PASSWORD
+	0x0008 MESSAGE_INTEGRITY_SHA1 "rfc8489"
+	0x0009 ERROR_CODE "rfc8489"
+	0x000A UNKNOWN_ATTRIBUTES "rfc8489"
+	0x000B Reserved // REFLECTED_FROM
+	0x000C CHANNEL_NUMBER "rfc8656"
+	0x000D LIFETIME "rfc8656"
+	0x000E-0x000F Reserved
+	0x0010 Reserved // BANDWIDTH
+	0x0011 Reserved
+	0x0012 XOR_PEER_ADDRESS "rfc8656"
+	0x0013 DATA "rfc8656"
+	0x0014 REALM "rfc8489"
+	0x0015 NONCE "rfc8489"
+	0x0016 XOR_RELAYED_ADDRESS "rfc8656"
+	0x0017 REQUESTED_ADDRESS_FAMILY "rfc8656"
+	0x0018 EVEN_PORT "rfc8656"
+	0x0019 REQUESTED_TRANSPORT "rfc8656"
+	0x001A DONT_FRAGMENT "rfc8656"
+	0x001B ACCESS_TOKEN "rfc7635"
+	0x001C MESSAGE_INTEGRITY_SHA256 "rfc8489"
+	0x001D PASSWORD_ALGORITHM "rfc8489"
+	0x001E USERHASH "rfc8489"
+	0x001F-0x001F Reserved
+	0x0020 XOR_MAPPED_ADDRESS "rfc8489"
+	0x0021 Reserved // TIMER_VAL
+	0x0022 RESERVATION_TOKEN "rfc8656"
+	0x0023 Reserved
+	0x0024 PRIORITY "rfc8445"
+	0x0025 USE_CANDIDATE "rfc8445"
+	0x0026 PADDING "rfc5780"
+	0x0027 RESPONSE_PORT "rfc5780"
+	0x0028-0x0029 Reserved
+	0x002A CONNECTION_ID "rfc6062"
+	0x002B-0x002F Reserved
+	0x0030 Reserved
+	0x0031-0x3FFF Reserved
+	// 0x4000-0x7FFF Private Use
+	0x8000 ADDITIONAL_ADDRESS_FAMILY "rfc8656"
+	0x8001 ADDRESS_ERROR_CODE "rfc8656"
+	0x8002 PASSWORD_ALGORITHMS "rfc8489"
+	0x8003 ALTERNATE_DOMAIN "rfc8489"
+	0x8004 ICMP "rfc8656"
+	0x8005-0x8021 Reserved
+	0x8022 SOFTWARE "rfc8489"
+	0x8023 ALTERNATE_SERVER "rfc8489"
+	0x8024 Reserved
+	0x8025 TRANSACTION_TRANSMIT_COUNTER "rfc7982"
+	0x8026 Reserved
+	0x8027 CACHE_TIMEOUT "rfc5780"
+	0x8028 FINGERPRINT "rfc8489"
+	0x8029 ICE_CONTROLLED "rfc8445"
+	0x802A ICE_CONTROLLING "rfc8445"
+	0x802B RESPONSE_ORIGIN "rfc5780"
+	0x802C OTHER_ADDRESS "rfc5780"
+	0x802D ECN_CHECK_STUN "rfc6679"
+	0x802E THIRD_PARTY_AUTHORIZATION "rfc7635"
+	0x802F Reserved
+	0x8030 MOBILITY_TICKET "rfc8016"
+	0x8031-0xBFFF Reserved
+	// 0xC000-0xFFFF Private Use
+	0xC000 CISCO_STUN_FLOWDATA "Dan Wing"
+	0xC001 ENF_FLOW_DESCRIPTION "Pål-Erik Martinsen"
+	0xC002 ENF_NETWORK_STATUS "Pål-Erik Martinsen"
+	0xC003 CISCO_WEBEX_FLOW_INFO "Stefano Giorcelli"
+	0xC004-0xC055 Reserved
+	0xC056 CITRIX_TRANSACTION_ID "Paras Babbar"
+	0xC057 GOOG_NETWORK_INFO "Jonas Oreland"
+	0xC058 GOOG_LAST_ICE_CHECK_RECEIVED "Jonas Oreland"
+	0xC059 GOOG_MISC_INFO "Jonas Oreland"
+	0xC05A GOOG_OBSOLETE_1 "Jonas Oreland"
+	0xC05B GOOG_CONNECTION_ID "Jonas Oreland"
+	0xC05C GOOG_DELTA "Jonas Oreland"
+	0xC05D GOOG_DELTA_ACK "Jonas Oreland"
+	0xC05E GOOG_DELTA_SYNC_REQ "Jonas Oreland"
+	0xC05F Reserved
+	0xC060 GOOG_MESSAGE_INTEGRITY_32 "Jonas Oreland"
+	0xC061-0xC06F Reserved
+	0xC070 META_DTLS_IN_STUN "Philipp Hancke"
+	0xC071 META_DTLS_IN_STUN_ACKNOWLEDGEMENT "Philipp Hancke"
+	0xC072-0xFFFF Reserved
+}
