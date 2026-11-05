@@ -1,6 +1,6 @@
 use std::{
 	io::{ErrorKind, IoSliceMut, Write},
-	net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+	net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 	os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 	process::{Command, Stdio},
 	ptr::null_mut,
@@ -12,7 +12,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::{
 	errno::Errno,
-	sys::socket::{MsgFlags, RecvMsg, SockaddrStorage, recvmsg},
+	sys::socket::{MsgFlags, RecvMsg, SockaddrStorage, getpeername, recvmsg},
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use stun::{Stun, zerocopy::TryFromBytes};
@@ -154,7 +154,8 @@ fn main() -> Result<()> {
 					// If there's less than 20 bytes read don't even try to read it as STUN
 					// Otherwise, bad data in the buffer from a previous read could close unrelated tcp streams.
 					// This isn't a problem for UDP since those are always complete/error
-					Ok(RecvMsg { bytes: ..20, .. }) => {
+					// TODO: I don't really know in what situation address would be None...
+					Ok(RecvMsg { bytes: ..20, .. }) | Ok(RecvMsg { address: None, .. }) => {
 						// Partially received TCP -> wait, UDP -> skip/drop
 						if is_tcp && !do_dispose {
 							continue;
@@ -163,6 +164,31 @@ fn main() -> Result<()> {
 						}
 					}
 					Ok(v) => v,
+				};
+
+				// Reconstitute the peer address
+				let address = address.unwrap();
+				let address = if is_tcp {
+					getpeername::<SockaddrStorage>(fd)
+						.ok()
+						.as_ref()
+						.and_then(SockaddrStorage::as_sockaddr_in6)
+						.cloned()
+						.map(Into::into)
+						.map(SocketAddr::V6)
+				} else {
+					Option::xor(
+						address
+							.as_sockaddr_in()
+							.cloned()
+							.map(Into::into)
+							.map(SocketAddr::V4),
+						address
+							.as_sockaddr_in6()
+							.cloned()
+							.map(Into::into)
+							.map(SocketAddr::V6),
+					)
 				};
 
 				let buffer_length = buffer.len();
@@ -207,6 +233,7 @@ fn main() -> Result<()> {
 			if is_tcp && do_dispose {
 				// SAFETY: We've checked that the socket is alive (not EBADF) so we just close/Drop.  If this is a problem, then just call close manually and check for errors.
 				info!("Closing stream");
+				poll.registry().deregister(&mut SourceFd(&fd))?;
 				unsafe { OwnedFd::from_raw_fd(fd) };
 			}
 		}
