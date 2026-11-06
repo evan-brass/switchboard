@@ -1,5 +1,17 @@
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
+#[repr(C, align(4))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, TryFromBytes, IntoBytes)]
+pub struct ErrorCode {
+	pad1: [u8; 2],
+	pub code: ErrCode,
+}
+impl From<ErrCode> for ErrorCode {
+	fn from(code: ErrCode) -> Self {
+		Self { pad1: [0; 2], code }
+	}
+}
+
 #[repr(u8)]
 #[derive(
 	Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, Unaligned, TryFromBytes, IntoBytes,

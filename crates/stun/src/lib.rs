@@ -2,13 +2,16 @@
 #![doc = include_str!("../README.md")]
 #![allow(unused)]
 
+pub use bytes;
 use bytes::BufMut;
-use core::{cell::Cell, fmt::Write, net::SocketAddr};
+use core::{cell::Cell, convert::Infallible, fmt::Write, net::SocketAddr};
 pub use zerocopy;
 use zerocopy::{
-	FromBytes, Immutable, IntoBytes, KnownLayout, SplitAt, TryFromBytes, Unaligned,
-	network_endian::U16, try_transmute,
+	AlignedTryCastError, ConvertError, FromBytes, Immutable, IntoBytes, KnownLayout, SplitAt,
+	TryFromBytes, Unaligned, network_endian::U16, try_transmute,
 };
+
+use crate::errcode::ErrCode;
 
 pub mod errcode;
 pub mod known;
@@ -99,12 +102,12 @@ impl Stun {
 	}
 }
 
-#[repr(C, align(4))]
-#[derive(Debug, PartialEq, Eq, KnownLayout, Immutable, FromBytes, SplitAt)]
+#[repr(C, packed)]
+#[derive(KnownLayout, Immutable, Unaligned, FromBytes, SplitAt, IntoBytes)]
 pub struct Attr {
 	pub typ: u16,
 	length: U16,
-	pub value: [u8], // Value may be longer than length while writing
+	pub value: [u8], // While writing: value is a buffer as big as the value could be (given u16 length requirements and buffer length inherited from Stun)
 }
 impl Attr {
 	pub const MAX_LENGTH: u16 = Stun::MAX_LENGTH - 4;
@@ -136,27 +139,18 @@ impl Stun {
 		}
 		20 + length as usize
 	}
-	/// Convert the in-place length into a safe offset to split at
-	fn offset(&self) -> usize {
-		let length = self.length.get().get();
-		if length.is_multiple_of(4) {
-			usize::min(length as usize >> 2, self.body.len())
-		} else {
-			0
-		}
-	}
-	pub fn split(&self) -> (&Self, &[[u8; 4]]) {
-		self.split_at(self.offset()).unwrap().via_into_bytes()
-	}
-	pub fn split_mut(&mut self) -> (&mut Self, &mut [[u8; 4]]) {
-		self.split_at_mut(self.offset()).unwrap().via_into_bytes()
-	}
 }
 impl<'i> IntoIterator for &'i Stun {
 	type Item = (&'i Stun, &'i Attr);
 	type IntoIter = AttrReader<'i>;
 	fn into_iter(self) -> Self::IntoIter {
-		let (target, _) = self.split();
+		let length = self.length.get().get();
+		let offset = if length.is_multiple_of(4) {
+			usize::min(length as usize >> 2, self.body.len())
+		} else {
+			0
+		};
+		let (target, _) = self.split_at(offset).unwrap().via_into_bytes();
 		target.clear(); // Zero the length since it is also our iterator offset.
 		Self::IntoIter { target }
 	}
@@ -164,18 +158,18 @@ impl<'i> IntoIterator for &'i Stun {
 impl<'i> Iterator for AttrReader<'i> {
 	type Item = (&'i Stun, &'i Attr);
 	fn next(&mut self) -> Option<Self::Item> {
-		let (prefix, rest) = self.target.split();
-		let Some(max_attr_len) = Attr::MAX_LENGTH.checked_sub(prefix.length.get().get()) else {
-			return None;
-		};
-		let (attr, _) = match Attr::ref_from_prefix_with_elems(rest.as_flattened(), 0) {
-			Err(zerocopy::ConvertError::Alignment(_)) => {
-				unreachable!("Every offset within Stun.body is also align(4)")
-			}
-			Err(zerocopy::ConvertError::Validity(_)) => {
-				unreachable!("Attr is FromBytes and has no bit validity requirements")
-			}
-			Err(zerocopy::ConvertError::Size(_)) => return None,
+		let length = self.target.length.get().get();
+		if !length.is_multiple_of(4) {
+			panic!("Corruption: Unaligned length");
+		}
+		let (prefix, rest) = self.target.split_at(length as usize >> 2)?.via_into_bytes();
+		let max_attr_len = Attr::MAX_LENGTH.checked_sub(length)?;
+		let attr = match Attr::ref_from_bytes(rest.as_flattened())
+			.map_err(ConvertError::<Infallible, _, Infallible>::from)
+		{
+			Err(ConvertError::Validity(v)) => match v {},
+			Err(ConvertError::Alignment(a)) => match a {},
+			Err(ConvertError::Size(s)) => return None,
 			Ok(v) => v,
 		};
 		let attr_length = attr.length.get();
@@ -192,29 +186,83 @@ impl<'i> Iterator for AttrReader<'i> {
 	}
 }
 
+impl Stun {
+	pub fn append(&mut self) -> AttrWriter<'_> {
+		let length = self.length.get().get();
+		if !length.is_multiple_of(4) {
+			panic!("Corruption: Unaligned length");
+		}
+		let offset = length as usize >> 2;
+		let Some((prefix, free_space)) = self.split_at_mut(offset).map(|s| s.via_into_bytes())
+		else {
+			panic!("Corruption: Length exceeds body");
+		};
+		let Some(max_attr_length) = Attr::MAX_LENGTH.checked_sub(length) else {
+			panic!("Can't append any more attributes: max length reached");
+		};
+		if free_space.len() == 0 {
+			// Stun messages are mostly fixed size (USERNAME and DATA being the main reachable exceptions)
+			panic!("Can't append any more attributes: buffer exhausted");
+		}
+		let max_value = usize::min(max_attr_length as usize, size_of_val(free_space) - 4);
+		let target =
+			Attr::mut_from_bytes_with_elems(free_space.as_flattened_mut(), max_value).unwrap();
+		target.length.set(0);
+
+		AttrWriter { prefix, target }
+	}
+}
 impl Drop for AttrWriter<'_> {
 	fn drop(&mut self) {
-		// TODO: Once the attribute has its final length, zero the Attribute's padding and increment the Stun's offset/length
-		todo!()
+		let length = self.target.length.get();
+		let padded_length = (length + 3) & !3;
+
+		// Zero the padding bytes
+		self.target.value[length as usize..padded_length as usize].fill(0);
+
+		// Advance the Stun message's length
+		self.prefix
+			.length
+			.update(|s| U16::new(s.get() + 4 + padded_length));
+	}
+}
+impl AttrWriter<'_> {
+	pub(crate) fn available(&mut self) -> &mut [u8] {
+		// There should be no overflow checks
+		let length = self.target.length.get() as usize;
+		&mut self.target.value[length..]
 	}
 }
 unsafe impl BufMut for AttrWriter<'_> {
 	fn remaining_mut(&self) -> usize {
-		todo!()
+		let length = self.target.length.get() as usize;
+		self.target.value.len() - length
 	}
 	unsafe fn advance_mut(&mut self, cnt: usize) {
-		todo!()
+		self.target.length += cnt as u16;
 	}
 	fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
-		todo!()
+		bytes::buf::UninitSlice::new(self.available())
 	}
 }
 impl Write for AttrWriter<'_> {
 	fn write_str(&mut self, s: &str) -> core::fmt::Result {
-		todo!()
+		if s.len() > self.remaining_mut() {
+			return Err(core::fmt::Error);
+		}
+		self.put_slice(s.as_bytes());
+		Ok(())
 	}
 }
 impl AttrWriter<'_> {
+	pub fn put_typ(&mut self, typ: u16) -> &mut Self {
+		self.target.typ = typ;
+		self
+	}
+	pub fn put_errorcode(&mut self, code: ErrCode) -> &mut Self {
+		self.put_slice(errcode::ErrorCode::from(code).as_bytes());
+		self
+	}
 	// BufMut extensions for STUN specific stuff
 	pub fn put_fingerprint(&mut self) {
 		todo!()
@@ -239,4 +287,12 @@ pub enum Transport {
 pub struct RequestedTransport {
 	pub proto: Transport,
 	pad1: [u8; 3],
+}
+impl From<Transport> for RequestedTransport {
+	fn from(proto: Transport) -> Self {
+		Self {
+			proto,
+			pad1: [0; 3],
+		}
+	}
 }

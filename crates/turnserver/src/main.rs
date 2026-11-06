@@ -15,7 +15,12 @@ use nix::{
 	sys::socket::{MsgFlags, RecvMsg, SockaddrStorage, getpeername, recvmsg},
 };
 use socket2::{Domain, Protocol, Socket, Type};
-use stun::{Class, RequestedTransport, Stun, errcode::ClientErr, known, zerocopy::TryFromBytes};
+use stun::{
+	Class, RequestedTransport, Stun,
+	errcode::{ClientErr, ErrCode},
+	known,
+	zerocopy::TryFromBytes,
+};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
@@ -231,14 +236,14 @@ fn main() -> Result<()> {
 					continue;
 				};
 
-				let mut error = None;
+				let mut error: Option<(ErrCode, &str)> = None;
 				let mut unknown_attributes = Vec::new();
 
 				for (_, attr) in msg.into_iter() {
 					match attr.typ {
 						known::REQUESTED_TRANSPORT => {
 							let Ok(_) = RequestedTransport::try_read_from_bytes(&attr.value) else {
-								error = Some((ClientErr::UnsupportedTransportProtocol, ""));
+								error = Some((ClientErr::UnsupportedTransportProtocol.into(), ""));
 								break;
 							};
 						}
@@ -252,8 +257,19 @@ fn main() -> Result<()> {
 					}
 				}
 				// TODO: return 401/403/441 if attributes are missing
+				// match method {
+				// 	Request::Bind => {
+				// 		todo!()
+				// 	}
+				// 	_ => continue,
+				// }
 
-				// Respond / Handle the message
+				// Unknown Attributes supercede any other errors I guess
+				if !unknown_attributes.is_empty() {
+					error = Some((ClientErr::UnknownAttribute.into(), ""));
+				}
+
+				// Report errors
 				if let Some((code, reason)) = error {
 					info!("Message handling returned error {code:?} {reason}");
 					if method.is_indication() {
@@ -261,8 +277,13 @@ fn main() -> Result<()> {
 					}
 					msg.clear();
 					msg.typ = method.failure().into();
-					// TODO: Write the
+					std::fmt::write(
+						msg.append().put_typ(known::ERROR_CODE).put_errorcode(code),
+						format_args!("{reason}"),
+					)?;
 				}
+
+				// TODO: Send the response
 			}
 
 			if is_tcp && do_dispose {
