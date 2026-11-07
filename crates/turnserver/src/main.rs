@@ -1,5 +1,5 @@
 use std::{
-	io::{ErrorKind, IoSliceMut, Write},
+	io::{ErrorKind, IoSlice, IoSliceMut, Write},
 	net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 	os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 	process::{Command, Stdio},
@@ -11,12 +11,18 @@ use eyre::{OptionExt, Result, eyre};
 use ipnet::{Ipv4Net, Ipv6Net};
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::{
+	cmsg_space,
 	errno::Errno,
-	sys::socket::{MsgFlags, RecvMsg, SockaddrStorage, getpeername, recvmsg},
+	libc::{in_pktinfo, in6_pktinfo},
+	sys::socket::{
+		ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SetSockOpt, SockaddrStorage,
+		getpeername, recvmsg, sendmsg,
+		sockopt::{Ipv4PacketInfo, Ipv6RecvPacketInfo},
+	},
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use stun::{
-	Class, RequestedTransport, Stun,
+	Class, Request, RequestedTransport, Stun,
 	errcode::{ClientErr, ErrCode},
 	known,
 	zerocopy::TryFromBytes,
@@ -44,10 +50,11 @@ fn main() -> Result<()> {
 		.ok_or_eyre("The behavior of ipnet's Ipv6AddrRange must have changed.")?;
 
 	// Apply our firewall rules using a child nft process
-	let mut nft = Command::new("nft")
+	let mut nft = Command::new("/usr/sbin/nft")
 		.args(["-i"])
 		.stdin(Stdio::piped())
 		.stderr(Stdio::inherit())
+		.stdout(Stdio::inherit())
 		.spawn()?;
 	let mut rules = nft.stdin.take().ok_or_eyre("Where's the nft stdin?")?;
 	// TODO: Might want to move this later in the program so that we don't trample anything else running on :3478 before we bind the socket...
@@ -85,6 +92,10 @@ fn main() -> Result<()> {
 
 	sock_nat6.set_only_v6(true)?;
 	sock_stream.set_only_v6(false)?;
+
+	Ipv4PacketInfo.set(&sock_stateless, &true)?;
+	Ipv4PacketInfo.set(&sock_nat4, &true)?;
+	Ipv6RecvPacketInfo.set(&sock_nat6, &true)?;
 
 	sock_stateless.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8743).into())?;
 	sock_nat4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 3478).into())?;
@@ -132,15 +143,12 @@ fn main() -> Result<()> {
 			loop {
 				// SAFETY: Always perform at least one syscall to check for closed sockets (EBADF) before double closing in do_dispose
 				let mut iov = [IoSliceMut::new(&mut buffer)];
-				let RecvMsg {
-					bytes: available,
-					address,
-					flags: _, // TODO: Do I need this?
-					..
-				} = match recvmsg::<SockaddrStorage>(
+				// Responses have to come from the same IP that the request was sent to
+				let mut control = cmsg_space!(in6_pktinfo, in_pktinfo);
+				let received_msg = match recvmsg::<SockaddrStorage>(
 					fd,
 					&mut iov,
-					None,
+					Some(&mut control),
 					if is_tcp {
 						MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK
 					} else {
@@ -170,10 +178,39 @@ fn main() -> Result<()> {
 					}
 					Ok(v) => v,
 				};
+				let RecvMsg {
+					bytes: available,
+					address,
+					flags: _, // TODO: Do I need this?
+					..
+				} = received_msg;
+
+				// For UDP clients, send the response via the same local IP they used to contact us
+				// I'm not exactly sure how nix fucked this API up so bad. It's borderline "just call the syscalls manually" bad.
+				// The linux CMSG crap breeds bullshit I suppose.
+				// control_out isn't even the real CMSG buffer, it's a temporary list that nix's sendmsg assembles into its own internal Vec.
+				let pi4;
+				let pi6;
+				let mut control_out = Vec::with_capacity(1);
+				for cmsg in received_msg.cmsgs()? {
+					match cmsg {
+						ControlMessageOwned::Ipv4PacketInfo(pi) => {
+							pi4 = pi;
+							control_out.push(ControlMessage::Ipv4PacketInfo(&pi4));
+							break;
+						}
+						ControlMessageOwned::Ipv6PacketInfo(pi) => {
+							pi6 = pi;
+							control_out.push(ControlMessage::Ipv6PacketInfo(&pi6));
+							break;
+						}
+						_ => warn!("Unused control message {cmsg:?}"),
+					}
+				}
 
 				// Reconstitute the peer address
 				let address = address.unwrap();
-				let address = if is_tcp {
+				let sender = if is_tcp {
 					getpeername::<SockaddrStorage>(fd)
 						.ok()
 						.as_ref()
@@ -230,9 +267,14 @@ fn main() -> Result<()> {
 					}
 				}
 
-				info!("STUN: {fd} {:?} {:?} {address:?}", msg.typ, msg.id);
+				info!("STUN: {fd} {:?} {:?} {sender:?}", msg.typ, msg.id);
 				let Class::Req(method) = msg.typ else {
 					info!("Dropping non-request message");
+					continue;
+				};
+
+				let Some(sender) = sender else {
+					warn!("Failed to reconstitute sender for {fd} {address}");
 					continue;
 				};
 
@@ -257,12 +299,16 @@ fn main() -> Result<()> {
 					}
 				}
 				// TODO: return 401/403/441 if attributes are missing
-				// match method {
-				// 	Request::Bind => {
-				// 		todo!()
-				// 	}
-				// 	_ => continue,
-				// }
+				match method {
+					Request::Bind => {
+						msg.clear();
+						msg.typ = method.success().into();
+						msg.append()
+							.put_typ(known::XOR_MAPPED_ADDRESS)
+							.put_xor_address(sender);
+					}
+					_ => continue,
+				}
 
 				// Unknown Attributes supercede any other errors I guess
 				if !unknown_attributes.is_empty() {
@@ -281,9 +327,28 @@ fn main() -> Result<()> {
 						msg.append().put_typ(known::ERROR_CODE).put_errorcode(code),
 						format_args!("{reason}"),
 					)?;
+					// TODO: Append an UnknownAttributes list?
 				}
 
-				// TODO: Send the response
+				// Send the response
+				let frame_length = msg.frame_length();
+				// TODO: For TCP clients, verify that we wouldn't overfill (past 1/2) socket's send buffer
+				let mut start = 0;
+
+				while start < frame_length {
+					let iov = &[IoSlice::new(&buffer[start..frame_length])];
+					let written =
+						match sendmsg(fd, iov, &control_out, MsgFlags::empty(), Some(&address)) {
+							Err(Errno::EINTR | Errno::EAGAIN) => continue,
+							Err(e) => {
+								info!("sndmsg error {e}");
+								do_dispose = true;
+								break;
+							}
+							Ok(n) => n,
+						};
+					start += written;
+				}
 			}
 
 			if is_tcp && do_dispose {

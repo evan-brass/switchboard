@@ -11,8 +11,7 @@ use zerocopy::{
 	TryFromBytes, Unaligned, network_endian::U16, try_transmute,
 };
 
-use crate::errcode::ErrCode;
-
+pub mod addr;
 pub mod errcode;
 pub mod known;
 
@@ -197,16 +196,18 @@ impl Stun {
 		else {
 			panic!("Corruption: Length exceeds body");
 		};
-		let Some(max_attr_length) = Attr::MAX_LENGTH.checked_sub(length) else {
+		let Some(proto_max_length) = Attr::MAX_LENGTH.checked_sub(length) else {
 			panic!("Can't append any more attributes: max length reached");
 		};
-		if free_space.len() == 0 {
-			// Stun messages are mostly fixed size (USERNAME and DATA being the main reachable exceptions)
+		let free_space = free_space.as_flattened_mut();
+		let Some(buffer_max_length) = free_space.len().checked_sub(4) else {
 			panic!("Can't append any more attributes: buffer exhausted");
-		}
-		let max_value = usize::min(max_attr_length as usize, size_of_val(free_space) - 4);
-		let target =
-			Attr::mut_from_bytes_with_elems(free_space.as_flattened_mut(), max_value).unwrap();
+		};
+		let (target, _) = Attr::mut_from_prefix_with_elems(
+			free_space,
+			usize::min(proto_max_length as usize, buffer_max_length),
+		)
+		.unwrap();
 		target.length.set(0);
 
 		AttrWriter { prefix, target }
@@ -259,7 +260,7 @@ impl AttrWriter<'_> {
 		self.target.typ = typ;
 		self
 	}
-	pub fn put_errorcode(&mut self, code: ErrCode) -> &mut Self {
+	pub fn put_errorcode(&mut self, code: errcode::ErrCode) -> &mut Self {
 		self.put_slice(errcode::ErrorCode::from(code).as_bytes());
 		self
 	}
@@ -270,8 +271,23 @@ impl AttrWriter<'_> {
 	pub fn put_integrity_sha1(&mut self) {
 		todo!()
 	}
-	pub fn put_address(&mut self, addr: SocketAddr) {
-		todo!()
+	pub fn put_address(&mut self, addr: SocketAddr) -> &mut Self {
+		match addr {
+			SocketAddr::V4(v4) => self.put_slice(addr::Addr::from(v4).as_bytes()),
+			SocketAddr::V6(v6) => self.put_slice(addr::Addr::from(v6).as_bytes()),
+		}
+		self
+	}
+	pub fn put_xor_address(&mut self, addr: SocketAddr) -> &mut Self {
+		match addr {
+			SocketAddr::V4(v4) => {
+				self.put_slice(addr::Addr::from(v4).xor(&self.prefix.id).as_bytes())
+			}
+			SocketAddr::V6(v6) => {
+				self.put_slice(addr::Addr::from(v6).xor(&self.prefix.id).as_bytes())
+			}
+		}
+		self
 	}
 }
 
