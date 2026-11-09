@@ -5,6 +5,8 @@
 pub use bytes;
 use bytes::BufMut;
 use core::{cell::Cell, convert::Infallible, fmt::Write, net::SocketAddr};
+use hmac::{Hmac, Mac, digest::FixedOutput};
+use sha1::Sha1;
 pub use zerocopy;
 use zerocopy::{
 	AlignedTryCastError, ConvertError, FromBytes, Immutable, IntoBytes, KnownLayout, SplitAt,
@@ -99,6 +101,12 @@ impl Stun {
 	pub fn clear(&self) {
 		self.length.set(U16::new(0));
 	}
+	pub fn reduce_over_prefix<F: FnMut(&[u8])>(&self, mut f: F) {
+		f(self.typ.as_bytes());
+		f(self.length.get().as_bytes());
+		f(self.id.as_bytes());
+		f(self.body.as_flattened());
+	}
 }
 
 #[repr(C, packed)]
@@ -118,7 +126,7 @@ impl Attr {
 	}
 	#[inline]
 	pub fn is_comprehension_required(&self) -> bool {
-		self.typ & 0x8000 == 0
+		self.typ & 0x8000 != 0
 	}
 }
 
@@ -222,9 +230,8 @@ impl Drop for AttrWriter<'_> {
 		self.target.value[length as usize..padded_length as usize].fill(0);
 
 		// Advance the Stun message's length
-		self.prefix
-			.length
-			.update(|s| U16::new(s.get() + 4 + padded_length));
+		let new_length = size_of_val(&self.prefix.body) as u16 + 4 + padded_length;
+		self.prefix.length.set(U16::new(new_length));
 	}
 }
 impl AttrWriter<'_> {
@@ -260,16 +267,20 @@ impl AttrWriter<'_> {
 		self.target.typ = typ;
 		self
 	}
-	pub fn put_errorcode(&mut self, code: errcode::ErrCode) -> &mut Self {
-		self.put_slice(errcode::ErrorCode::from(code).as_bytes());
+	pub fn put_errorcode<C: Into<errcode::ErrCode>>(&mut self, code: C) -> &mut Self {
+		self.put_slice(errcode::ErrorCode::from(code.into()).as_bytes());
 		self
 	}
 	// BufMut extensions for STUN specific stuff
-	pub fn put_fingerprint(&mut self) {
-		todo!()
-	}
-	pub fn put_integrity_sha1(&mut self) {
-		todo!()
+	pub fn put_integrity_sha1(&mut self, mut authkey: Hmac<Sha1>) {
+		self.put_typ(known::MESSAGE_INTEGRITY_SHA1);
+		self.target.length.set(0);
+
+		// We need to pre-increment the Stun length so that reduce_over_prefix matches what it would by when decoding
+		self.prefix.length.update(|v| v + 24);
+		self.prefix
+			.reduce_over_prefix(|chunk| authkey.update(chunk));
+		self.put_slice(&authkey.finalize_fixed().0);
 	}
 	pub fn put_address(&mut self, addr: SocketAddr) -> &mut Self {
 		match addr {

@@ -4,15 +4,22 @@ add chain inet turnserver prerouting { type filter hook prerouting priority raw;
 add rule inet turnserver prerouting meta l4proto != udp return
 add rule inet turnserver prerouting udp dport != 3478 return
 add rule inet turnserver prerouting @th,96,32 != 0x2112A442 notrack # STUN Magic Cookie
-add rule inet turnserver prerouting @th,64,16 vmap { 0x0003: return, 0x0016: return } # STUN Allocate, Send
+add rule inet turnserver prerouting @th,64,16 vmap { 0x0003: return, 0x0004: return, 0x0016: return } # STUN Allocate, Refresh, Send
 add rule inet turnserver prerouting notrack
 
 add chain inet turnserver output { type filter hook output priority raw; policy accept; }
 add rule inet turnserver output meta l4proto != udp return
 add rule inet turnserver output udp sport != 3478 return
 add rule inet turnserver output @th,96,32 != 0x2112A442 notrack # STUN Magic Cookie
-add rule inet turnserver output @th,64,16 vmap { 0x0103: return, 0x0017: return } # STUN Allocated, Recv
+add rule inet turnserver output @th,64,16 vmap { 0x0103: return, 0x0113: return, 0x0104: return, 0x0017: return } # STUN Allocated, NotAllocated, Refreshed, Recv
 add rule inet turnserver output notrack
+
+add chain inet turnserver output_mark { type filter hook output priority filter; policy accept; }
+add rule inet turnserver output_mark meta l4proto != udp return
+add rule inet turnserver output_mark udp sport != 3478 return
+add rule inet turnserver output_mark @th,96,32 != 0x2112A442 return
+add rule inet turnserver output_mark @th,64,16 0x0103 ct mark set 0x01 # STUN Allocated marks the connection as OK for Refreshes and Recv
+add rule inet turnserver output_mark ct mark != 0x01 @th,64,16 vmap { 0x0104: drop, 0x0017: drop } # Until a successful Allocate, drop Refreshed, Recv
 
 add chain inet turnserver input { type nat hook input priority srcnat; policy accept; }
 add rule inet turnserver input meta l4proto != udp return

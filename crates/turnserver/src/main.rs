@@ -1,13 +1,15 @@
 use std::{
+	fmt,
 	io::{ErrorKind, IoSlice, IoSliceMut, Write},
-	net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-	os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+	os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 	process::{Command, Stdio},
 	ptr::null_mut,
 	str::FromStr,
 };
 
 use eyre::{OptionExt, Result, eyre};
+use hmac::{Hmac, KeyInit, Mac, digest::FixedOutput};
 use ipnet::{Ipv4Net, Ipv6Net};
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use nix::{
@@ -15,20 +17,28 @@ use nix::{
 	errno::Errno,
 	libc::{in_pktinfo, in6_pktinfo},
 	sys::socket::{
-		ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg, SetSockOpt, SockaddrStorage,
-		getpeername, recvmsg, sendmsg,
-		sockopt::{Ipv4PacketInfo, Ipv6RecvPacketInfo},
+		ControlMessage, ControlMessageOwned, GetSockOpt, MsgFlags, RecvMsg, SetSockOpt,
+		SockaddrStorage, getpeername, recvmsg, sendmsg,
+		sockopt::{Ipv4PacketInfo, Ipv6RecvPacketInfo, SndBuf},
 	},
 };
+use sha1::Sha1;
 use socket2::{Domain, Protocol, Socket, Type};
 use stun::{
 	Class, Request, RequestedTransport, Stun,
-	errcode::{ClientErr, ErrCode},
+	bytes::BufMut,
+	errcode::{
+		ClientErr,
+		ErrCode::{self},
+	},
 	known,
-	zerocopy::TryFromBytes,
+	zerocopy::{FromBytes, IntoBytes, TryFromBytes, network_endian::U32, transmute},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
+
+// ioctl to read how much data is unacked
+nix::ioctl_read_bad!(ioctl_tiocoutq, nix::libc::TIOCOUTQ, std::ffi::c_int);
 
 fn main() -> Result<()> {
 	let ts = tracing_subscriber::fmt::Subscriber::builder()
@@ -75,37 +85,33 @@ fn main() -> Result<()> {
 
 	// 0.0.0.0:8743/udp, 0.0.0.0:3478/udp, [::]:3478/udp?v6-only, [::]:3478/tcp
 	let sock_stateless = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-	let sock_nat4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-	let sock_nat6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+	let sock_nat = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
 	let sock_stream = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
 
 	// For tcp streams we map their fd into 0.0.0.0/8
 	let fd_net = Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 8).unwrap();
 	// We need to mask out all our currently open file descriptors so that they aren't publicly reachable/writable...
 	// This isn't doing that, it is just guessing that we've used all the fds from 0-sock_stream.
-	let fd_net_bottom = [&sock_stateless, &sock_nat4, &sock_nat6, &sock_stream]
+	let fd_net_bottom = [&sock_stateless, &sock_nat, &sock_stream]
 		.map(|s| s.as_raw_fd() as u32 + 1)
 		.into_iter()
 		.max()
 		.unwrap();
 	let fd_net_hosts = fd_net_bottom..=fd_net.hostmask().to_bits();
 
-	sock_nat6.set_only_v6(true)?;
+	sock_nat.set_only_v6(false)?;
 	sock_stream.set_only_v6(false)?;
 
 	Ipv4PacketInfo.set(&sock_stateless, &true)?;
-	Ipv4PacketInfo.set(&sock_nat4, &true)?;
-	Ipv6RecvPacketInfo.set(&sock_nat6, &true)?;
+	Ipv6RecvPacketInfo.set(&sock_nat, &true)?; // Hopefully with dual-stack this also includes ipv4 packets?
 
 	sock_stateless.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8743).into())?;
-	sock_nat4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 3478).into())?;
-	sock_nat6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
+	sock_nat.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 	sock_stream.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 
 	tun.set_nonblocking(true)?;
 	sock_stateless.set_nonblocking(true)?;
-	sock_nat4.set_nonblocking(true)?;
-	sock_nat6.set_nonblocking(true)?;
+	sock_nat.set_nonblocking(true)?;
 	sock_stream.set_nonblocking(true)?;
 
 	sock_stream.listen(10)?;
@@ -119,8 +125,7 @@ fn main() -> Result<()> {
 	register(&poll, tun.as_raw_fd())?;
 	let tun_token = Token(tun.as_raw_fd() as usize);
 	register(&poll, sock_stateless.as_raw_fd())?;
-	register(&poll, sock_nat4.as_raw_fd())?;
-	register(&poll, sock_nat6.as_raw_fd())?;
+	register(&poll, sock_nat.as_raw_fd())?;
 	register(&poll, sock_stream.as_raw_fd())?;
 	let accept_token = Token(sock_stream.as_raw_fd() as usize);
 
@@ -272,23 +277,80 @@ fn main() -> Result<()> {
 					info!("Dropping non-request message");
 					continue;
 				};
+				if method == Request::Recv {
+					continue;
+				}
 
 				let Some(sender) = sender else {
 					warn!("Failed to reconstitute sender for {fd} {address}");
 					continue;
 				};
+				let relayed_ip = net.network()
+					| if is_tcp {
+						Ipv6Addr::from_octets(transmute!([
+							[0; 4],
+							[0; 4],
+							[0; 4],
+							u32::to_be_bytes(fd as u32)
+						]))
+					} else {
+						net.hostmask()
+							& match sender.ip() {
+								IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+								IpAddr::V6(v6) => v6,
+							}
+					};
+				let sender = SocketAddr::new(sender.ip().to_canonical(), sender.port());
 
-				let mut error: Option<(ErrCode, &str)> = None;
+				// Message handling state (updated while parsing attributes)
+				let mut error: Option<(ErrCode, String)> = None;
 				let mut unknown_attributes = Vec::new();
+				let mut authkey: Option<Hmac<Sha1>> = None;
+				let mut integrity = false;
+				let mut lifetime = 240;
 
-				for (_, attr) in msg.into_iter() {
+				for (prefix, attr) in msg.into_iter() {
 					match attr.typ {
 						known::REQUESTED_TRANSPORT => {
 							let Ok(_) = RequestedTransport::try_read_from_bytes(&attr.value) else {
-								error = Some((ClientErr::UnsupportedTransportProtocol.into(), ""));
-								break;
+								error = Some((
+									ClientErr::UnsupportedTransportProtocol.into(),
+									format!(""),
+								));
+								continue;
 							};
 						}
+						known::MESSAGE_INTEGRITY_SHA1 => {
+							if let Some(authkey) = &authkey {
+								let mut check = authkey.clone();
+								prefix.reduce_over_prefix(|chunk| check.update(chunk));
+								integrity = check.finalize_fixed().0 == attr.value;
+							}
+							break;
+						}
+						known::USERNAME => match str::from_utf8(&attr.value) {
+							Err(e) => {
+								error = Some((ClientErr::BadRequest.into(), format!("{e}")));
+							}
+							Ok(v) => {
+								// Accepts any username as long as the credential==password and realm==none
+								let mut hash = md5::Context::new();
+								hash.consume(v);
+								hash.consume(":none:password");
+								let hash = hash.finalize();
+								authkey = Some(Hmac::new_from_slice(&hash.0)?)
+							}
+						},
+						known::REALM => {}
+						known::NONCE => {
+							// TODO: Proper nonce handling
+						}
+						known::LIFETIME => match U32::read_from_bytes(&attr.value) {
+							Err(e) => {
+								error = Some((ClientErr::BadRequest.into(), format!("{e}")));
+							}
+							Ok(v) => lifetime = u32::min(lifetime, v.get()),
+						},
 						_ if attr.is_comprehension_required() => {
 							unknown_attributes.push(attr.typ);
 							warn!(" - {:04X} {:?}", u16::from_be(attr.typ), &attr.value);
@@ -298,8 +360,15 @@ fn main() -> Result<()> {
 						}
 					}
 				}
+				// Unknown Attributes supercede any other errors I guess
+				if !unknown_attributes.is_empty() {
+					error = Some((ClientErr::UnknownAttribute.into(), format!("")));
+				}
+
 				// TODO: return 401/403/441 if attributes are missing
 				match method {
+					_ if error.is_some() => {}
+
 					Request::Bind => {
 						msg.clear();
 						msg.typ = method.success().into();
@@ -307,12 +376,34 @@ fn main() -> Result<()> {
 							.put_typ(known::XOR_MAPPED_ADDRESS)
 							.put_xor_address(sender);
 					}
+					Request::Send => {}
+					// No username = 401
+					_ if authkey.is_none() => {
+						msg.typ = method.failure().into();
+						msg.clear();
+						fmt::write(
+							msg.append()
+								.put_typ(known::ERROR_CODE)
+								.put_errorcode(ClientErr::Unauthenticated),
+							format_args!(""),
+						)?;
+						msg.append().put_typ(known::REALM).put_slice(b"none");
+						msg.append().put_typ(known::NONCE).put_slice(b"none"); // TODO: Proper nonce generation
+					}
+					// Bad integrity = 403
+					_ if !integrity => error = Some((ClientErr::Forbidden.into(), format!(""))),
+					Request::Allocate => {
+						msg.clear();
+						msg.typ = method.success().into();
+						msg.append()
+							.put_typ(known::XOR_MAPPED_ADDRESS)
+							.put_address(sender);
+						msg.append().put_typ(known::LIFETIME).put_u32(lifetime);
+						msg.append()
+							.put_typ(known::XOR_RELAYED_ADDRESS)
+							.put_xor_address(SocketAddr::new(relayed_ip.into(), sender.port()));
+					}
 					_ => continue,
-				}
-
-				// Unknown Attributes supercede any other errors I guess
-				if !unknown_attributes.is_empty() {
-					error = Some((ClientErr::UnknownAttribute.into(), ""));
 				}
 
 				// Report errors
@@ -327,11 +418,37 @@ fn main() -> Result<()> {
 						msg.append().put_typ(known::ERROR_CODE).put_errorcode(code),
 						format_args!("{reason}"),
 					)?;
-					// TODO: Append an UnknownAttributes list?
+					if !unknown_attributes.is_empty() {
+						msg.append()
+							.put_typ(known::UNKNOWN_ATTRIBUTES)
+							.put_slice(unknown_attributes.as_bytes());
+					}
+				}
+
+				// Append message integrity if the request also was hmac'd
+				if let (Some(authkey), true) = (authkey, integrity) {
+					msg.append().put_integrity_sha1(authkey);
 				}
 
 				// Send the response
 				let frame_length = msg.frame_length();
+
+				// Check to make sure we're not overfilling the send buffer
+				let buffer_size = SndBuf.get(&unsafe { BorrowedFd::borrow_raw(fd) })?;
+				let safe_size = buffer_size / 2;
+				let mut waiting = 0;
+				assert_eq!(
+					unsafe { ioctl_tiocoutq(fd, &mut waiting) }?,
+					0,
+					"TIOCOUTQ returned non-zero"
+				);
+				assert!(waiting >= 0, "Negative queue consumption?");
+				let if_sent_size = waiting as usize + frame_length;
+				if if_sent_size > safe_size {
+					info!("Dropping response due to TCP queueing");
+					continue;
+				}
+
 				// TODO: For TCP clients, verify that we wouldn't overfill (past 1/2) socket's send buffer
 				let mut start = 0;
 
@@ -375,6 +492,10 @@ fn main() -> Result<()> {
 					error!(
 						"{fd} is not within our fd network! Dropping connection from {address:?}"
 					);
+					continue;
+				}
+				if let Err(e) = stream.set_tcp_nodelay(true) {
+					warn!("{e} during tcp_nodelay");
 					continue;
 				}
 				if let Err(e) = register(&poll, fd) {
