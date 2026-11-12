@@ -83,38 +83,50 @@ fn main() -> Result<()> {
 		.enable(false)
 		.build_sync()?;
 
+	// Netlink socket to query conntrack
+	let sock_netlink = Socket::new(
+		Domain::from(nix::libc::AF_NETLINK),
+		Type::RAW,
+		Some(Protocol::from(nix::libc::NETLINK_NETFILTER)),
+	)?;
+
 	// 0.0.0.0:8743/udp, 0.0.0.0:3478/udp, [::]:3478/udp?v6-only, [::]:3478/tcp
 	let sock_stateless = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-	let sock_nat = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+	let sock_nat4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+	let sock_nat6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
 	let sock_stream = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
 
 	// For tcp streams we map their fd into 0.0.0.0/8
 	let fd_net = Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 8).unwrap();
 	// We need to mask out all our currently open file descriptors so that they aren't publicly reachable/writable...
 	// This isn't doing that, it is just guessing that we've used all the fds from 0-sock_stream.
-	let fd_net_bottom = [&sock_stateless, &sock_nat, &sock_stream]
+	let fd_net_bottom = [&sock_stateless, &sock_nat4, &sock_nat6, &sock_stream]
 		.map(|s| s.as_raw_fd() as u32 + 1)
 		.into_iter()
 		.max()
 		.unwrap();
 	let fd_net_hosts = fd_net_bottom..=fd_net.hostmask().to_bits();
 
-	sock_nat.set_only_v6(false)?;
-	sock_nat.set_reuse_port(true)?;
+	sock_nat4.set_reuse_port(true)?;
+	sock_nat6.set_reuse_port(true)?;
+	sock_nat6.set_only_v6(true)?;
 	sock_stream.set_only_v6(false)?;
 	sock_stream.set_reuse_address(true)?;
 	sock_stream.set_reuse_port(true)?;
 
 	Ipv4PacketInfo.set(&sock_stateless, &true)?;
-	Ipv6RecvPacketInfo.set(&sock_nat, &true)?; // Hopefully with dual-stack this also includes ipv4 packets?
+	Ipv4PacketInfo.set(&sock_nat4, &true)?;
+	Ipv6RecvPacketInfo.set(&sock_nat6, &true)?; // Hopefully with dual-stack this also includes ipv4 packets?
 
 	sock_stateless.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8743).into())?;
-	sock_nat.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
+	sock_nat4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 3478).into())?;
+	sock_nat6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 	sock_stream.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3478, 0, 0).into())?;
 
 	tun.set_nonblocking(true)?;
 	sock_stateless.set_nonblocking(true)?;
-	sock_nat.set_nonblocking(true)?;
+	sock_nat4.set_nonblocking(true)?;
+	sock_nat6.set_nonblocking(true)?;
 	sock_stream.set_nonblocking(true)?;
 
 	sock_stream.listen(10)?;
@@ -128,7 +140,8 @@ fn main() -> Result<()> {
 	register(&poll, tun.as_raw_fd())?;
 	let tun_token = Token(tun.as_raw_fd() as usize);
 	register(&poll, sock_stateless.as_raw_fd())?;
-	register(&poll, sock_nat.as_raw_fd())?;
+	register(&poll, sock_nat4.as_raw_fd())?;
+	register(&poll, sock_nat6.as_raw_fd())?;
 	register(&poll, sock_stream.as_raw_fd())?;
 	let accept_token = Token(sock_stream.as_raw_fd() as usize);
 
@@ -199,15 +212,26 @@ fn main() -> Result<()> {
 				// control_out isn't even the real CMSG buffer, it's a temporary list that nix's sendmsg assembles into its own internal Vec.
 				let pi4;
 				let pi6;
+				let mut receiver = None;
 				let mut control_out = Vec::with_capacity(1);
+				let is_stateless = fd == sock_stateless.as_raw_fd();
+				let local_port = if is_stateless { 8743 } else { 3478 };
 				for cmsg in received_msg.cmsgs()? {
 					match cmsg {
 						ControlMessageOwned::Ipv4PacketInfo(pi) => {
+							receiver = Some(SocketAddr::new(
+								Ipv4Addr::from_bits(u32::from_be(pi.ipi_addr.s_addr)).into(),
+								local_port,
+							));
 							pi4 = pi;
 							control_out.push(ControlMessage::Ipv4PacketInfo(&pi4));
 							break;
 						}
 						ControlMessageOwned::Ipv6PacketInfo(pi) => {
+							receiver = Some(SocketAddr::new(
+								Ipv6Addr::from_octets(pi.ipi6_addr.s6_addr).into(),
+								local_port,
+							));
 							pi6 = pi;
 							control_out.push(ControlMessage::Ipv6PacketInfo(&pi6));
 							break;
@@ -303,7 +327,6 @@ fn main() -> Result<()> {
 								IpAddr::V6(v6) => v6,
 							}
 					};
-				let sender = SocketAddr::new(sender.ip().to_canonical(), sender.port());
 
 				// Message handling state (updated while parsing attributes)
 				let mut error: Option<(ErrCode, String)> = None;
@@ -401,12 +424,26 @@ fn main() -> Result<()> {
 						msg.clear();
 						msg.typ = method.success().into();
 
-						let xor_mapped = if is_tcp {
-							sender
-						} else {
-							// Firefox uses the XOR_MAPPED_ADDRESS as a srflx candidate.  Chrome ignores it.  Chrome is better.
-							// TODO: Lookup the conntrack entry to find the peers original ip+port
-							todo!()
+						// If we have a local address, then this must be UDP and we must un-nat the src address
+						let xor_mapped = match (sender, receiver) {
+							(_, None) => sender, // TCP Allocation
+							(_, _) if is_stateless => sender,
+							(SocketAddr::V4(_sender), Some(SocketAddr::V4(_receiver))) => {
+								// TODO: use nelink to retrieve the client's original ip + port from conntrack
+								SocketAddr::new(Ipv4Addr::new(169, 254, 0, 1).into(), 42)
+							}
+							(SocketAddr::V6(_sender), Some(SocketAddr::V6(_receiver))) => {
+								// TODO: use netlink to retrieve the client's original ip + port from conntrack
+								SocketAddr::new(
+									Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(),
+									42,
+								)
+							}
+							_ => {
+								return Err(eyre!(
+									"Corruption: Mismatched local and remote addresses"
+								));
+							}
 						};
 
 						msg.append()

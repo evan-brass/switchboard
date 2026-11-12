@@ -383,6 +383,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "socket2",
+ "zerocopy",
+]
+
+[[package]]
 name = "netlink-packet-core"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

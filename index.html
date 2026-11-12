@@ -4,11 +4,9 @@
 		iceServers: [
 			{
 				urls: [
-					"stun:192.168.10.200", // Load bearing for Firefox... because the XOR_MAPPED returned with my allocations is incorrect.
 					"turn:192.168.10.200",
 					"turn:192.168.10.200:8743",
 					"turn:192.168.10.200?transport=tcp",
-					"stun:[2001:470:eb23::200]", // Load bearing for Firefox...
 					"turn:[2001:470:eb23::200]",
 					"turn:[2001:470:eb23::200]?transport=tcp",
 				],
