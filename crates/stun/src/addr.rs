@@ -63,7 +63,7 @@ where
 	X: Xored,
 	[u8; N]: Version,
 {
-	pub fn xor(mut self, id: &Txid) -> Addr<X::Other, [u8; N]> {
+	pub fn xor(self, id: &Txid) -> Addr<X::Other, [u8; N]> {
 		let xor_bytes: &[u8; 16] = transmute_ref!(id);
 		let port = from_fn(|i| self.port[i] ^ xor_bytes[i]);
 		let octets = from_fn(|i| self.octets[i] ^ xor_bytes[i]);

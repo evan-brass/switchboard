@@ -137,6 +137,7 @@ fn main() -> Result<()> {
 			.register(&mut SourceFd(&fd), token, Interest::READABLE)?;
 		Ok(())
 	}
+	register(&poll, sock_netlink.as_raw_fd())?;
 	register(&poll, tun.as_raw_fd())?;
 	let tun_token = Token(tun.as_raw_fd() as usize);
 	register(&poll, sock_stateless.as_raw_fd())?;
@@ -280,7 +281,7 @@ fn main() -> Result<()> {
 				// Frames which exceed our buffer
 				if frame_length > buffer_length {
 					do_dispose = true;
-					break;
+					if is_tcp { break } else { continue }
 				}
 				// Frames which are not fully received
 				if frame_length > available {
