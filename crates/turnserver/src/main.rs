@@ -100,7 +100,10 @@ fn main() -> Result<()> {
 	let fd_net_hosts = fd_net_bottom..=fd_net.hostmask().to_bits();
 
 	sock_nat.set_only_v6(false)?;
+	sock_nat.set_reuse_port(true)?;
 	sock_stream.set_only_v6(false)?;
+	sock_stream.set_reuse_address(true)?;
+	sock_stream.set_reuse_port(true)?;
 
 	Ipv4PacketInfo.set(&sock_stateless, &true)?;
 	Ipv6RecvPacketInfo.set(&sock_nat, &true)?; // Hopefully with dual-stack this also includes ipv4 packets?
@@ -365,6 +368,8 @@ fn main() -> Result<()> {
 					error = Some((ClientErr::UnknownAttribute.into(), format!("")));
 				}
 
+				// TESTING:
+
 				// TODO: return 401/403/441 if attributes are missing
 				match method {
 					_ if error.is_some() => {}
@@ -395,9 +400,18 @@ fn main() -> Result<()> {
 					Request::Allocate => {
 						msg.clear();
 						msg.typ = method.success().into();
+
+						let xor_mapped = if is_tcp {
+							sender
+						} else {
+							// Firefox uses the XOR_MAPPED_ADDRESS as a srflx candidate.  Chrome ignores it.  Chrome is better.
+							// TODO: Lookup the conntrack entry to find the peers original ip+port
+							todo!()
+						};
+
 						msg.append()
 							.put_typ(known::XOR_MAPPED_ADDRESS)
-							.put_address(sender);
+							.put_xor_address(xor_mapped);
 						msg.append().put_typ(known::LIFETIME).put_u32(lifetime);
 						msg.append()
 							.put_typ(known::XOR_RELAYED_ADDRESS)

@@ -19,9 +19,9 @@
 	};
 	const t = new RTCPeerConnection(config);
 	t.addEventListener("icecandidate", ({ candidate }) => {
-		if (!candidate) return;
-		if (candidate.type == "host") return;
-		console.log(candidate);
+		if (!["relay", "srflx"].includes(candidate?.type)) return;
+		const { 4: address, 5: port, 7: typ } = candidate.candidate.split(" ");
+		console.log(typ, address, port);
 	});
 	t.addEventListener("icecandidateerror", console.error);
 	t.createDataChannel("");
