@@ -3,8 +3,15 @@ name = "netlink"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Enables the `Netlink` socket wrapper (requires std + libc)
+socket = ["dep:libc"]
+
 [dependencies]
-bytes = "1.12.1"
-libc = "0.2.191"
-socket2 = { version = "0.6.5", features = ["all"] }
+bytes = { version = "1.12.1", default-features = false }
+libc = { version = "0.2.191", optional = true }
 zerocopy = { version = "0.8.63", features = ["derive"] }
+
+[dev-dependencies]
+libc = "0.2.191"
