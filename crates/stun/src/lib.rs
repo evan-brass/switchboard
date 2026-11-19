@@ -15,6 +15,7 @@ use zerocopy::{
 
 pub mod addr;
 pub mod errcode;
+pub mod fixed;
 pub mod known;
 
 #[repr(u8)]

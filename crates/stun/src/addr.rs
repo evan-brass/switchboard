@@ -38,13 +38,24 @@ impl Version for [u8; 4] {
 pub trait Xored {
 	type Other: Xored;
 }
+#[derive(Debug)]
 pub struct Xor;
+#[derive(Debug)]
 pub struct NotXor;
 impl Xored for Xor {
 	type Other = NotXor;
 }
 impl Xored for NotXor {
 	type Other = Xor;
+}
+
+#[repr(u8)]
+#[derive(
+	Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, Unaligned, TryFromBytes, IntoBytes,
+)]
+pub enum Family {
+	IPv4 = 0x01,
+	IPv6 = 0x02,
 }
 
 #[repr(C)]
