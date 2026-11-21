@@ -5,6 +5,8 @@
 #[cfg(any(feature = "socket", test))]
 extern crate std;
 
+pub mod netfilter;
+
 pub use bytes;
 use bytes::BufMut;
 use core::{fmt, fmt::Write, marker::PhantomData};
@@ -92,7 +94,9 @@ impl<P: Protocol> fmt::Debug for nlmsghdr<P> {
 
 /// Payload of an NLMSG_ERROR message: the error code followed by the header of the request that caused it.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, Unaligned, FromBytes, IntoBytes)]
+#[derive(
+	Debug, Clone, Copy, PartialEq, Eq, KnownLayout, Immutable, Unaligned, FromBytes, IntoBytes,
+)]
 pub struct nlmsgerr {
 	/// 0 for an ACK, otherwise a negative errno
 	pub error: I32,
@@ -104,6 +108,7 @@ pub struct nlmsgerr {
 }
 
 /// The decoded contents of a message
+#[derive(Debug)]
 pub enum Body<'a, P: Protocol> {
 	/// A protocol message: its family header and attributes
 	Msg(P::Header<'a>, Attrs<'a>),
@@ -227,9 +232,10 @@ impl<P: Protocol> nlmsghdr<P> {
 			}
 			typ if typ < known::NLMSG_MIN_TYPE => Body::Unknown,
 			typ => match P::header(typ, payload) {
-				Some((header, size)) => {
-					Body::Msg(header, Attrs::new(payload.get(align4(size)..).unwrap_or(&[])))
-				}
+				Some((header, size)) => Body::Msg(
+					header,
+					Attrs::new(payload.get(align4(size)..).unwrap_or(&[])),
+				),
 				None => Body::Unknown,
 			},
 		}
@@ -315,7 +321,7 @@ impl nlattr {
 }
 
 /// Iterator over a run of attributes. Stops at the first malformed / truncated attribute.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Attrs<'i> {
 	rest: &'i [u8],
 }

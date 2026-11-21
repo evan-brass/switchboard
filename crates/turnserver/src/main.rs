@@ -12,6 +12,16 @@ use eyre::{OptionExt, Result, eyre};
 use hmac::{Hmac, KeyInit, Mac, digest::FixedOutput};
 use ipnet::{Ipv4Net, Ipv6Net};
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
+use netlink::{
+	Netlink,
+	known::{NLA_F_NET_BYTEORDER, NLM_F_REQUEST},
+	netfilter::{
+		CTA_IP_V4_DST, CTA_IP_V4_SRC, CTA_IP_V6_DST, CTA_IP_V6_SRC, CTA_PROTO_DST_PORT,
+		CTA_PROTO_NUM, CTA_PROTO_SRC_PORT, CTA_TUPLE_IP, CTA_TUPLE_ORIG, CTA_TUPLE_PROTO,
+		CTA_TUPLE_REPLY, CtOp, Netfilter, nfgenmsg,
+	},
+	nlmsghdr,
+};
 use nix::{
 	cmsg_space,
 	errno::Errno,
@@ -84,11 +94,7 @@ fn main() -> Result<()> {
 		.build_sync()?;
 
 	// Netlink socket to query conntrack
-	let sock_netlink = Socket::new(
-		Domain::from(nix::libc::AF_NETLINK),
-		Type::RAW,
-		Some(Protocol::from(nix::libc::NETLINK_NETFILTER)),
-	)?;
+	let mut sock_netlink = Netlink::new(nix::libc::NETLINK_NETFILTER)?;
 
 	// 0.0.0.0:8743/udp, 0.0.0.0:3478/udp, [::]:3478/udp?v6-only, [::]:3478/tcp
 	let sock_stateless = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -147,6 +153,7 @@ fn main() -> Result<()> {
 	let accept_token = Token(sock_stream.as_raw_fd() as usize);
 
 	let mut buffer = vec![0; 65536].into_boxed_slice();
+	let mut nl_buffer = vec![0; 1024].into_boxed_slice();
 
 	loop {
 		let mut do_accept = false;
@@ -425,25 +432,136 @@ fn main() -> Result<()> {
 						msg.clear();
 						msg.typ = method.success().into();
 
+						let nlmsg = nlmsghdr::<Netfilter>::mut_from_bytes(&mut nl_buffer).unwrap();
+						nlmsg.typ.set(Netfilter::Ct(CtOp::Get).into());
+						nlmsg.flags.set(NLM_F_REQUEST);
+						nlmsg.clear();
+
 						// If we have a local address, then this must be UDP and we must un-nat the src address
 						let xor_mapped = match (sender, receiver) {
 							(_, None) => sender, // TCP Allocation
 							(_, _) if is_stateless => sender,
-							(SocketAddr::V4(_sender), Some(SocketAddr::V4(_receiver))) => {
-								// TODO: use nelink to retrieve the client's original ip + port from conntrack
-								SocketAddr::new(Ipv4Addr::new(169, 254, 0, 1).into(), 42)
-							}
-							(SocketAddr::V6(_sender), Some(SocketAddr::V6(_receiver))) => {
-								// TODO: use netlink to retrieve the client's original ip + port from conntrack
-								SocketAddr::new(
-									Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(),
-									42,
-								)
-							}
-							_ => {
-								return Err(eyre!(
-									"Corruption: Mismatched local and remote addresses"
-								));
+							(sender, Some(receiver)) => {
+								nlmsg.put_header(&nfgenmsg {
+									family: netlink::netfilter::Family::IPv4,
+									ver: 0,
+									pad1: [0, 0],
+								});
+
+								// The reply direction is local->srnat because we
+								let mut reply = nlmsg.append();
+								reply.put_typ(CTA_TUPLE_REPLY);
+								let mut ip = reply.nest();
+								ip.put_typ(CTA_TUPLE_IP);
+								match (sender.ip(), receiver.ip()) {
+									(IpAddr::V4(sender), IpAddr::V4(receiver)) => {
+										ip.nest()
+											.put_typ(CTA_IP_V4_SRC)
+											.put_u32(receiver.to_bits());
+										ip.nest().put_typ(CTA_IP_V4_DST).put_u32(sender.to_bits());
+									}
+									(IpAddr::V6(sender), IpAddr::V6(receiver)) => {
+										ip.nest()
+											.put_typ(CTA_IP_V6_SRC | NLA_F_NET_BYTEORDER)
+											.put_slice(&receiver.octets());
+										ip.nest()
+											.put_typ(CTA_IP_V6_DST | NLA_F_NET_BYTEORDER)
+											.put_slice(&sender.octets());
+									}
+									_ => {
+										return Err(eyre!(
+											"Corruption: Mismatched local and remote addresses"
+										));
+									}
+								}
+								drop(ip);
+								let mut proto = reply.nest();
+								proto.put_typ(CTA_TUPLE_PROTO);
+								proto
+									.nest()
+									.put_typ(CTA_PROTO_NUM)
+									.put_u8(nix::libc::IPPROTO_UDP as u8);
+								proto
+									.nest()
+									.put_typ(CTA_PROTO_SRC_PORT)
+									.put_u16(receiver.port());
+								proto
+									.nest()
+									.put_typ(CTA_PROTO_DST_PORT)
+									.put_u16(sender.port());
+								drop(proto);
+								drop(reply);
+
+								let seq = sock_netlink.send(nlmsg)?;
+
+								loop {
+									let _ = match sock_netlink.recv(&mut nl_buffer) {
+										Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+										Ok(message_len) if message_len > nl_buffer.len() => {
+											warn!(
+												"Netlink message with length {message_len} was truncated, skipping."
+											);
+											continue;
+										}
+										v => v?,
+									};
+									let nlmsg =
+										nlmsghdr::<Netfilter>::mut_from_bytes(&mut nl_buffer)
+											.unwrap();
+									if nlmsg.seq != seq {
+										continue;
+									}
+									match nlmsg.body() {
+										netlink::Body::Ack(attrs) => {
+											let errmsg = format_args!(
+												"Conntrack response has missing attributes {attrs:?}"
+											);
+											let orig = attrs
+												.clone()
+												.find(|a| a.typ() == CTA_TUPLE_ORIG)
+												.ok_or_eyre(std::fmt::format(errmsg))?;
+											let ip = orig
+												.nested()
+												.find(|a| a.typ() == CTA_TUPLE_IP)
+												.ok_or_eyre(std::fmt::format(errmsg))?;
+											let ip = match sender.ip() {
+												IpAddr::V4(_) => Ipv4Addr::from_octets(
+													ip.nested()
+														.find(|a| a.typ() == CTA_IP_V4_SRC)
+														.ok_or_eyre(std::fmt::format(errmsg))?
+														.value
+														.try_into()?,
+												)
+												.into(),
+												IpAddr::V6(_) => Ipv6Addr::from_octets(
+													ip.nested()
+														.find(|a| a.typ() == CTA_IP_V6_SRC) // TODO: Doesn't this need to have NET_BYTEORDER crap?
+														.ok_or_eyre(std::fmt::format(errmsg))?
+														.value
+														.try_into()?,
+												)
+												.into(),
+											};
+											let port = orig
+												.nested()
+												.find(|a| a.typ() == CTA_TUPLE_PROTO)
+												.ok_or_eyre(std::fmt::format(errmsg))?
+												.nested()
+												.find(|a| a.typ() == CTA_PROTO_SRC_PORT)
+												.ok_or_eyre(std::fmt::format(errmsg))?
+												.value
+												.try_into()?;
+											let port = u16::from_ne_bytes(port);
+											break SocketAddr::new(ip, port);
+										}
+										b => {
+											warn!(
+												"Unexpected netlink message matching our seq {b:?}"
+											);
+											continue;
+										}
+									}
+								}
 							}
 						};
 

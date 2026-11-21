@@ -1,7 +1,6 @@
 use crate::{known::*, *};
 use zerocopy::{
-	FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
-	network_endian::U16 as BeU16,
+	FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, network_endian::U16 as BeU16,
 };
 
 // Stand-in for a wrapper crate's family header
@@ -29,7 +28,11 @@ fn build(buf: &mut [u8]) -> usize {
 	{
 		let mut orig = msg.append();
 		orig.put_typ(1);
-		orig.nest().put_typ(1).nest().put_typ(1).put_slice(&[192, 168, 0, 1]);
+		orig.nest()
+			.put_typ(1)
+			.nest()
+			.put_typ(1)
+			.put_slice(&[192, 168, 0, 1]);
 		orig.nest().put_typ(2).nest().put_typ(1).put_u8(17);
 	}
 	write!(msg.append().put_typ(9), "abc").unwrap();
@@ -147,7 +150,14 @@ fn error_uncapped_with_ext_ack() {
 	let mut buf = [0u8; 128];
 	// Echoed request payload contains bytes that would parse as an attribute; they must be skipped
 	let echo = [8, 0, NLMSGERR_ATTR_MSG as u8, 0, b'n', b'o', 0, 0];
-	control(&mut buf, NLMSG_ERROR, &err(-2, 8), false, &echo, Some("Bad thing"));
+	control(
+		&mut buf,
+		NLMSG_ERROR,
+		&err(-2, 8),
+		false,
+		&echo,
+		Some("Bad thing"),
+	);
 	let msg = nlmsghdr::<Nf>::ref_from_bytes(&buf).unwrap();
 	let Body::Error(e) = msg.body() else { panic!() };
 	assert_eq!(e.code, -2);

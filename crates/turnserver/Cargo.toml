@@ -16,3 +16,4 @@ stun = { path = "../stun" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tun-rs = "2.8.16"
+netlink = { path = "../netlink", features = ["socket"] }

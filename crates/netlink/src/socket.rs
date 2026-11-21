@@ -15,13 +15,8 @@ pub struct Netlink {
 impl Netlink {
 	/// `proto` is one of `known::NETLINK_*`
 	pub fn new(proto: i32) -> io::Result<Self> {
-		let fd = unsafe {
-			libc::socket(
-				libc::AF_NETLINK,
-				libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-				proto,
-			)
-		};
+		let fd =
+			unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, proto) };
 		if fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
